@@ -19,9 +19,9 @@ BuildRequires:	autoconf
 BuildRequires:	automake
 BuildRequires:	libtool
 # Really needed?
-BuildRequires:	gcc >= 4
-BuildRequires:	glibc-headers >= 2.4.0
+BuildRequires:	gcc >= 5:4.0
 BuildRequires:	gettext
+BuildRequires:	glibc-headers >= 6:2.4.0
 #Requires(post):	/sbin/ldconfig
 #Requires(post):	/sbin/telinit
 BuildRoot:	%{tmpdir}/%{name}-%{version}-root-%(id -u -n)
@@ -41,8 +41,8 @@ shutdown and supervising them while the system is running.
 %description -l pl
 upstart jest zamiennikiem demona /sbin/init zajmuj±cym siê
 uruchamianiem zadañ i serwisów podczas startu systemu, ich
-zatrzymywaniem podczas wy³±czania systemu, a tak¿e nadzorowaniem
-ich pracy.
+zatrzymywaniem podczas wy³±czania systemu, a tak¿e nadzorowaniem ich
+pracy.
 
 %prep
 %setup -q
@@ -50,7 +50,7 @@ ich pracy.
 %patch0 -p1
 
 %build
-%configure 
+%configure
 %{__make}
 
 %install
