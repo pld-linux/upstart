@@ -2,7 +2,8 @@
 # - userland headers needs to be fixed - inotify.h is missing
 # - more fixes needed
 #
-Summary:	event-based init daemon
+Summary:	Event-based init daemon
+Summary(pl):	Oparty na zdarzeniach demon init
 Name:		upstart
 Version:	0.2.1
 Release:	0.1
@@ -28,7 +29,15 @@ BuildRoot:	%{tmpdir}/%{name}-%{version}-root-%(id -u -n)
 %define		_sbindir		/sbin
 
 %description
-upstart is a replacement for the /sbin/init daemon which handles starting of tasks and services during boot, stopping them during shutdown and supervising them while the system is running.
+upstart is a replacement for the /sbin/init daemon which handles
+starting of tasks and services during boot, stopping them during
+shutdown and supervising them while the system is running.
+
+%description -l pl
+upstart jest zamiennikiem demona /sbin/init zajmuj±cym siê
+uruchamianiem zadañ i serwisów podczas startu systemu, ich
+zatrzymywaniem podczas wy³±czania systemu, a tak¿e nadzorowaniem
+ich pracy.
 
 %prep
 %setup -q
