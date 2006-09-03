@@ -40,9 +40,8 @@ shutdown and supervising them while the system is running.
 
 %description -l pl
 upstart jest zamiennikiem demona /sbin/init zajmuj±cym siê
-uruchamianiem zadañ i serwisów podczas startu systemu, ich
-zatrzymywaniem podczas wy³±czania systemu, a tak¿e nadzorowaniem ich
-pracy.
+uruchamianiem zadañ i us³ug podczas startu systemu, ich zatrzymywaniem
+podczas wy³±czania systemu, a tak¿e nadzorowaniem ich pracy.
 
 %prep
 %setup -q
