@@ -1,3 +1,7 @@
+# TODO:
+# - userland headers needs to be fixed - inotify.h is missing
+# - more fixes needed
+#
 Summary:	event-based init daemon
 Name:		upstart
 Version:	0.2.1
@@ -12,7 +16,6 @@ BuildRequires:	autoconf
 BuildRequires:	automake
 BuildRequires:	libtool
 BuildRequires:	gettext
-BuildRequires:	klibc-devel
 #Requires(post):	/sbin/ldconfig
 #Requires(post):	/sbin/telinit
 BuildRoot:	%{tmpdir}/%{name}-%{version}-root-%(id -u -n)
