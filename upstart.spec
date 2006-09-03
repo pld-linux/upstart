@@ -1,6 +1,7 @@
 # TODO:
 # - userland headers needs to be fixed - inotify.h is missing
 # - more fixes needed
+# - does it require gcc4?? __builtin_offsetof
 #
 Summary:	Event-based init daemon
 Summary(pl):	Oparty na zdarzeniach demon init
@@ -16,6 +17,8 @@ URL:		https://launchpad.net/products/upstart
 BuildRequires:	autoconf
 BuildRequires:	automake
 BuildRequires:	libtool
+# Really needed?
+BuildRequires:	gcc >= 4
 BuildRequires:	gettext
 #Requires(post):	/sbin/ldconfig
 #Requires(post):	/sbin/telinit
