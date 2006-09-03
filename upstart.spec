@@ -20,6 +20,7 @@ BuildRequires:	automake
 BuildRequires:	libtool
 # Really needed?
 BuildRequires:	gcc >= 4
+BuildRequires:	glibc-devel >= 2.4.0
 BuildRequires:	gettext
 #Requires(post):	/sbin/ldconfig
 #Requires(post):	/sbin/telinit
