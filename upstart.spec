@@ -6,8 +6,12 @@ License:	GPL v2
 Group:		Base
 # Isn't there better download URL???
 Source0:	http://people.ubuntu.com/~scott/software/upstart/%{name}-%{version}.tar.bz2
-# Source0-md5:	d95228b4ed14e85b05c792ce9ec88c9d
+# Source0-md5:	67be7df5ed181713d638d18269d86e8f
 URL:		https://launchpad.net/products/upstart
+BuildRequires:	autoconf
+BuildRequires:	automake
+BuildRequires:	libtool
+BuildRequires:	gettext
 BuildRequires:	klibc-devel
 #Requires(post):	/sbin/ldconfig
 #Requires(post):	/sbin/telinit
@@ -59,8 +63,7 @@ rm -rf $RPM_BUILD_ROOT
 
 %files
 %defattr(644,root,root,755)
-%doc AUTHORS ChangeLog 
-#%doc README AUTHORS ChangeLog NEWS TODO
+%doc AUTHORS ChangeLog HACKING NEWS TODO
 #%dir %{_sysconfdir}
 #%dir %{_libdir}
 #%attr(755,root,root) /%{_lib}/libinitng.so.*.*.*
