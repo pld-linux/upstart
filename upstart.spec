@@ -5,9 +5,10 @@ Release:	0.1
 License:	GPL v2
 Group:		Base
 # Isn't there better download URL???
-Source0:	http://librarian.launchpad.net/4093784/%{name}_%{version}.orig.tar.gz
+Source0:	http://people.ubuntu.com/~scott/software/upstart/%{name}-%{version}.tar.bz2
 # Source0-md5:	d95228b4ed14e85b05c792ce9ec88c9d
 URL:		https://launchpad.net/products/upstart
+BuildRequires:	klibc-devel
 #Requires(post):	/sbin/ldconfig
 #Requires(post):	/sbin/telinit
 BuildRoot:	%{tmpdir}/%{name}-%{version}-root-%(id -u -n)
@@ -26,7 +27,7 @@ upstart is a replacement for the /sbin/init daemon which handles starting of tas
 %setup -q
 
 %build
-%configure
+%configure 
 %{__make}
 
 %install
@@ -58,6 +59,7 @@ rm -rf $RPM_BUILD_ROOT
 
 %files
 %defattr(644,root,root,755)
+%doc AUTHORS ChangeLog 
 #%doc README AUTHORS ChangeLog NEWS TODO
 #%dir %{_sysconfdir}
 #%dir %{_libdir}
