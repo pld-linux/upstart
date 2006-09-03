@@ -15,12 +15,12 @@ Source0:	http://people.ubuntu.com/~scott/software/upstart/%{name}-%{version}.tar
 # Source0-md5:	67be7df5ed181713d638d18269d86e8f
 Patch0:		%{name}-builtin_offsetof.patch
 URL:		https://launchpad.net/products/upstart
-BuildRequires:	autoconf
-BuildRequires:	automake
-BuildRequires:	libtool
+BuildRequires:	autoconf >= 2.59
+BuildRequires:	automake >= 1:1.9
+BuildRequires:	libtool >= 2:1.5.22
+BuildRequires:	gettext >= 0.14.5
 # Really needed?
 BuildRequires:	gcc >= 5:4.0
-BuildRequires:	gettext
 BuildRequires:	glibc-headers >= 6:2.4.0
 #Requires(post):	/sbin/ldconfig
 #Requires(post):	/sbin/telinit
