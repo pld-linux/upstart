@@ -1,18 +1,19 @@
 # TODO:
 # - userland headers needs to be fixed - inotify.h is missing
-# - more fixes needed
-# - does it require gcc4?? __builtin_offsetof
+# - does it require gcc4?? __builtin_offsetof definition added for gcc3.3
+# - it seems it requires some kernel-related definitions...
 #
 Summary:	Event-based init daemon
 Summary(pl):	Oparty na zdarzeniach demon init
 Name:		upstart
 Version:	0.2.1
-Release:	0.1
+Release:	0.2
 License:	GPL v2
 Group:		Base
 # Isn't there better download URL???
 Source0:	http://people.ubuntu.com/~scott/software/upstart/%{name}-%{version}.tar.bz2
 # Source0-md5:	67be7df5ed181713d638d18269d86e8f
+Patch0:		%{name}-builtin_offsetof.patch
 URL:		https://launchpad.net/products/upstart
 BuildRequires:	autoconf
 BuildRequires:	automake
@@ -44,6 +45,8 @@ ich pracy.
 
 %prep
 %setup -q
+# for gcc3.3 only:
+%patch0 -p1
 
 %build
 %configure 
