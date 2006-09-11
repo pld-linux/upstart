@@ -1,6 +1,5 @@
 # TODO:
 # - userland headers needs to be fixed - inotify.h is missing
-# - does it require gcc4?? __builtin_offsetof definition added for gcc3.3
 # - it seems it requires some kernel-related definitions...
 #
 Summary:	Event-based init daemon
@@ -13,13 +12,11 @@ Group:		Base
 # Isn't there better download URL???
 Source0:	http://people.ubuntu.com/~scott/software/upstart/%{name}-%{version}.tar.bz2
 # Source0-md5:	67be7df5ed181713d638d18269d86e8f
-Patch0:		%{name}-builtin_offsetof.patch
 URL:		https://launchpad.net/products/upstart
 BuildRequires:	autoconf >= 2.59
 BuildRequires:	automake >= 1:1.9
 BuildRequires:	libtool >= 2:1.5.22
 BuildRequires:	gettext >= 0.14.5
-# Really needed?
 BuildRequires:	gcc >= 5:4.0
 BuildRequires:	glibc-headers >= 6:2.4.0
 #Requires(post):	/sbin/ldconfig
@@ -45,8 +42,6 @@ podczas wy³±czania systemu, a tak¿e nadzorowaniem ich pracy.
 
 %prep
 %setup -q
-# for gcc3.3 only:
-%patch0 -p1
 
 %build
 %configure
