@@ -3,7 +3,7 @@
 # - it seems it requires some kernel-related definitions...
 #
 Summary:	Event-based init daemon
-Summary(pl):	Oparty na zdarzeniach demon init
+Summary(pl.UTF-8):   Oparty na zdarzeniach demon init
 Name:		upstart
 Version:	0.3.0
 Release:	0.1
@@ -35,10 +35,10 @@ upstart is a replacement for the /sbin/init daemon which handles
 starting of tasks and services during boot, stopping them during
 shutdown and supervising them while the system is running.
 
-%description -l pl
-upstart jest zamiennikiem demona /sbin/init zajmuj±cym siê
-uruchamianiem zadañ i us³ug podczas startu systemu, ich zatrzymywaniem
-podczas wy³±czania systemu, a tak¿e nadzorowaniem ich pracy.
+%description -l pl.UTF-8
+upstart jest zamiennikiem demona /sbin/init zajmujÄ…cym siÄ™
+uruchamianiem zadaÅ„ i usÅ‚ug podczas startu systemu, ich zatrzymywaniem
+podczas wyÅ‚Ä…czania systemu, a takÅ¼e nadzorowaniem ich pracy.
 
 %prep
 %setup -q
