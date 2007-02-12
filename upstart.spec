@@ -3,7 +3,7 @@
 # - it seems it requires some kernel-related definitions...
 #
 Summary:	Event-based init daemon
-Summary(pl.UTF-8):   Oparty na zdarzeniach demon init
+Summary(pl.UTF-8):	Oparty na zdarzeniach demon init
 Name:		upstart
 Version:	0.3.0
 Release:	0.1
