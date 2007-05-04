@@ -5,13 +5,12 @@
 Summary:	Event-based init daemon
 Summary(pl.UTF-8):	Oparty na zdarzeniach demon init
 Name:		upstart
-Version:	0.3.0
+Version:	0.3.8
 Release:	0.1
 License:	GPL v2
 Group:		Base
-# Isn't there better download URL???
-Source0:	http://people.ubuntu.com/~scott/software/upstart/%{name}-%{version}.tar.bz2
-# Source0-md5:	269046f41c6418225306280044a799eb
+Source0:	http://upstart.ubuntu.com/download/0.3/%{name}-%{version}.tar.bz2
+# Source0-md5:	5cdd2dc3a3f02089c9450edf4e8f4941
 URL:		https://launchpad.net/products/upstart
 BuildRequires:	autoconf >= 2.59
 BuildRequires:	automake >= 1:1.9
