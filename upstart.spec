@@ -11,7 +11,7 @@ License:	GPL v2
 Group:		Base
 Source0:	http://upstart.ubuntu.com/download/0.3/%{name}-%{version}.tar.bz2
 # Source0-md5:	5cdd2dc3a3f02089c9450edf4e8f4941
-URL:		https://launchpad.net/products/upstart
+URL:		https://launchpad.net/upstart
 BuildRequires:	autoconf >= 2.59
 BuildRequires:	automake >= 1:1.9
 BuildRequires:	libtool >= 2:1.5.22
