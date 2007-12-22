@@ -5,12 +5,12 @@
 Summary:	Event-based init daemon
 Summary(pl.UTF-8):	Oparty na zdarzeniach demon init
 Name:		upstart
-Version:	0.3.8
+Version:	0.3.9
 Release:	0.1
 License:	GPL v2
 Group:		Base
 Source0:	http://upstart.ubuntu.com/download/0.3/%{name}-%{version}.tar.bz2
-# Source0-md5:	5cdd2dc3a3f02089c9450edf4e8f4941
+# Source0-md5:	794208083d405ece123ad59a02f3e233
 URL:		https://launchpad.net/upstart
 BuildRequires:	autoconf >= 2.59
 BuildRequires:	automake >= 1:1.9
@@ -18,15 +18,11 @@ BuildRequires:	libtool >= 2:1.5.22
 BuildRequires:	gettext >= 0.14.5
 BuildRequires:	gcc >= 5:4.0
 BuildRequires:	glibc-headers >= 6:2.4.0
-#Requires(post):	/sbin/ldconfig
-#Requires(post):	/sbin/telinit
+Provides:	initscripts
+Obsoletes:	initscripts
 BuildRoot:	%{tmpdir}/%{name}-%{version}-root-%(id -u -n)
 
-%define		_exec_prefix	/
-%define		_sysconfdir		/etc/%{name}
-%define		_libdir			/%{_lib}/%{name}
-%define		_bindir			%{_prefix}/sbin
-# this is to avoid ugly //sbin
+%define		_libdir			/%{_lib}/
 %define		_sbindir		/sbin
 
 %description
@@ -43,41 +39,30 @@ podczas wyłączania systemu, a także nadzorowaniem ich pracy.
 %setup -q
 
 %build
+%{__aclocal} -I m4
+%{__autoconf}
+%{__automake}
 %configure
 %{__make}
 
 %install
 rm -rf $RPM_BUILD_ROOT
-#install -d $RPM_BUILD_ROOT%{_sysconfdir}
 
-#%{__make} install \
-#	DESTDIR=$RPM_BUILD_ROOT
+%{__make} install \
+	DESTDIR=$RPM_BUILD_ROOT
+
+%find_lang upstart
 
 %clean
 rm -rf $RPM_BUILD_ROOT
 
-%post
-/sbin/ldconfig
-#if [ "$1" = 1 ]; then
-#	%banner -e %{name} <<-EOF
-#Remember to add init=%{_sbindir}/initng in your grub or lilo config to use initng.
-#
-#You should install 'initng-pld' for PLD Linux rc-scripts based scripts,
-#or 'initng-initscripts' for the original distributed scripts.
-#
-#Happy testing.
-#EOF
-#fi
-#
-#/sbin/telinit u || :
-
-%postun	-p /sbin/ldconfig
-
-%files
+%files -f upstart.lang
 %defattr(644,root,root,755)
 %doc AUTHORS ChangeLog HACKING NEWS TODO
-#%dir %{_sysconfdir}
-#%dir %{_libdir}
-#%attr(755,root,root) /%{_lib}/libinitng.so.*.*.*
-#%attr(755,root,root) %{_sbindir}/initng
-#%{_mandir}/man8/initng.8*
+%dir %{_sysconfdir}/upstart
+%dir %{_sysconfdir}/upstart/event.d
+%{_sysconfdir}/upstart/event.d/logd
+%dir %{_libdir}/upstart
+%attr(755,root,root) %{_libdir}/upstart/*.so
+%attr(755,root,root) %{_sbindir}/*
+%{_mandir}/man8/*
