@@ -14,16 +14,17 @@ Source0:	http://upstart.ubuntu.com/download/0.3/%{name}-%{version}.tar.bz2
 URL:		https://launchpad.net/upstart
 BuildRequires:	autoconf >= 2.59
 BuildRequires:	automake >= 1:1.9
-BuildRequires:	libtool >= 2:1.5.22
-BuildRequires:	gettext >= 0.14.5
 BuildRequires:	gcc >= 5:4.0
+BuildRequires:	gettext >= 0.14.5
 BuildRequires:	glibc-headers >= 6:2.4.0
+BuildRequires:	libtool >= 2:1.5.22
 Provides:	initscripts
 Obsoletes:	initscripts
 BuildRoot:	%{tmpdir}/%{name}-%{version}-root-%(id -u -n)
 
-%define		_libdir			/%{_lib}/
+%define		_libdir			/%{_lib}
 %define		_sbindir		/sbin
+%define		_sysconfdir		/etc/%{name}
 
 %description
 upstart is a replacement for the /sbin/init daemon which handles
@@ -42,7 +43,8 @@ podczas wyłączania systemu, a także nadzorowaniem ich pracy.
 %{__aclocal} -I m4
 %{__autoconf}
 %{__automake}
-%configure
+%configure \
+	--disable-static
 %{__make}
 
 %install
@@ -53,16 +55,34 @@ rm -rf $RPM_BUILD_ROOT
 
 %find_lang upstart
 
+# no -devel
+rm -rf $RPM_BUILD_ROOT%{_includedir}
+rm -rf $RPM_BUILD_ROOT%{_libdir}/*.{la,so}
+rm -rf $RPM_BUILD_ROOT%{_aclocaldir}
+
 %clean
 rm -rf $RPM_BUILD_ROOT
+
+%post	-p /sbin/ldconfig
+%postun	-p /sbin/ldconfig
 
 %files -f upstart.lang
 %defattr(644,root,root,755)
 %doc AUTHORS ChangeLog HACKING NEWS TODO
-%dir %{_sysconfdir}/upstart
-%dir %{_sysconfdir}/upstart/event.d
-%{_sysconfdir}/upstart/event.d/logd
-%dir %{_libdir}/upstart
-%attr(755,root,root) %{_libdir}/upstart/*.so
-%attr(755,root,root) %{_sbindir}/*
-%{_mandir}/man8/*
+%dir %{_sysconfdir}
+%dir %{_sysconfdir}/event.d
+%{_sysconfdir}/event.d/logd
+%attr(755,root,root) %{_sbindir}/init
+%attr(755,root,root) %{_sbindir}/initctl
+%attr(755,root,root) %{_sbindir}/logd
+%attr(755,root,root) %{_sbindir}/start
+%attr(755,root,root) %{_sbindir}/status
+%attr(755,root,root) %{_sbindir}/stop
+%attr(755,root,root) %{_libdir}/lib*.so.*.*.*
+%attr(755,root,root) %ghost %{_libdir}/lib*.so.?
+%{_mandir}/man8/init.8*
+%{_mandir}/man8/initctl.8*
+%{_mandir}/man8/logd.8*
+%{_mandir}/man8/start.8*
+%{_mandir}/man8/status.8*
+%{_mandir}/man8/stop.8*
