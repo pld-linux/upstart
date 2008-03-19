@@ -6,7 +6,7 @@ Summary:	Event-based init daemon
 Summary(pl.UTF-8):	Oparty na zdarzeniach demon init
 Name:		upstart
 Version:	0.3.9
-Release:	0.1
+Release:	1
 License:	GPL v2
 Group:		Base
 Source0:	http://upstart.ubuntu.com/download/0.3/%{name}-%{version}.tar.bz2
@@ -18,8 +18,6 @@ BuildRequires:	gcc >= 5:4.0
 BuildRequires:	gettext >= 0.14.5
 BuildRequires:	glibc-headers >= 6:2.4.0
 BuildRequires:	libtool >= 2:1.5.22
-Provides:	initscripts
-Obsoletes:	initscripts
 BuildRoot:	%{tmpdir}/%{name}-%{version}-root-%(id -u -n)
 
 %define		_libdir			/%{_lib}
@@ -44,7 +42,8 @@ podczas wyłączania systemu, a także nadzorowaniem ich pracy.
 %{__autoconf}
 %{__automake}
 %configure \
-	--disable-static
+	--disable-static \
+	--enable-compat
 %{__make}
 
 %install
@@ -72,17 +71,18 @@ rm -rf $RPM_BUILD_ROOT
 %dir %{_sysconfdir}
 %dir %{_sysconfdir}/event.d
 %{_sysconfdir}/event.d/logd
+%attr(755,root,root) %{_sbindir}/halt
 %attr(755,root,root) %{_sbindir}/init
 %attr(755,root,root) %{_sbindir}/initctl
 %attr(755,root,root) %{_sbindir}/logd
+%attr(755,root,root) %{_sbindir}/poweroff
+%attr(755,root,root) %{_sbindir}/reboot
+%attr(755,root,root) %{_sbindir}/runlevel
+%attr(755,root,root) %{_sbindir}/shutdown
 %attr(755,root,root) %{_sbindir}/start
 %attr(755,root,root) %{_sbindir}/status
 %attr(755,root,root) %{_sbindir}/stop
+%attr(755,root,root) %{_sbindir}/telinit
 %attr(755,root,root) %{_libdir}/lib*.so.*.*.*
 %attr(755,root,root) %ghost %{_libdir}/lib*.so.?
-%{_mandir}/man8/init.8*
-%{_mandir}/man8/initctl.8*
-%{_mandir}/man8/logd.8*
-%{_mandir}/man8/start.8*
-%{_mandir}/man8/status.8*
-%{_mandir}/man8/stop.8*
+%{_mandir}/man8/*.8*
