@@ -14,6 +14,8 @@ BuildRequires:	gcc >= 5:4.0
 BuildRequires:	gettext >= 0.14.5
 BuildRequires:	glibc-headers >= 6:2.4.0
 BuildRequires:	libtool >= 2:1.5.22
+Provides:	virtual(init-daemon)
+Obsoletes:	virtual(init-daemon)
 BuildRoot:	%{tmpdir}/%{name}-%{version}-root-%(id -u -n)
 
 %define		_libdir			/%{_lib}
