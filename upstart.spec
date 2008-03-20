@@ -2,7 +2,7 @@ Summary:	Event-based init daemon
 Summary(pl.UTF-8):	Oparty na zdarzeniach demon init
 Name:		upstart
 Version:	0.3.9
-Release:	1
+Release:	2
 License:	GPL v2
 Group:		Base
 Source0:	http://upstart.ubuntu.com/download/0.3/%{name}-%{version}.tar.bz2
@@ -38,7 +38,6 @@ podczas wyłączania systemu, a także nadzorowaniem ich pracy.
 %{__autoconf}
 %{__automake}
 %configure \
-	--disable-static \
 	--enable-compat
 %{__make}
 
