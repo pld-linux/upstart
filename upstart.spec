@@ -1,7 +1,3 @@
-# TODO:
-# - userland headers needs to be fixed - inotify.h is missing
-# - it seems it requires some kernel-related definitions...
-#
 Summary:	Event-based init daemon
 Summary(pl.UTF-8):	Oparty na zdarzeniach demon init
 Name:		upstart
