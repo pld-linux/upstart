@@ -78,6 +78,8 @@ rm -rf $RPM_BUILD_ROOT
 %attr(755,root,root) %{_sbindir}/status
 %attr(755,root,root) %{_sbindir}/stop
 %attr(755,root,root) %{_sbindir}/telinit
-%attr(755,root,root) %{_libdir}/lib*.so.*.*.*
-%attr(755,root,root) %ghost %{_libdir}/lib*.so.?
+%attr(755,root,root) %{_libdir}/libnih.so.*.*.*
+%attr(755,root,root) %ghost %{_libdir}/libnih.so.0
+%attr(755,root,root) %{_libdir}/libupstart.so.*.*.*
+%attr(755,root,root) %ghost %{_libdir}/libupstart.so.0
 %{_mandir}/man8/*.8*
