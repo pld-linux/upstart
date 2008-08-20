@@ -1,12 +1,12 @@
 Summary:	Event-based init daemon
 Summary(pl.UTF-8):	Oparty na zdarzeniach demon init
 Name:		upstart
-Version:	0.3.9
+Version:	0.5.0
 Release:	2
 License:	GPL v2
 Group:		Base
-Source0:	http://upstart.ubuntu.com/download/0.3/%{name}-%{version}.tar.bz2
-# Source0-md5:	794208083d405ece123ad59a02f3e233
+Source0:	http://edge.launchpad.net/upstart/0.5/%{version}/+download/%{name}-%{version}.tar.gz
+# Source0-md5:	df5e2db549b6ebf406d48419831a66b8
 URL:		https://launchpad.net/upstart
 BuildRequires:	autoconf >= 2.59
 BuildRequires:	automake >= 1:1.9
@@ -19,9 +19,7 @@ Obsoletes:	virtual(init-daemon)
 Suggests:	dbus
 BuildRoot:	%{tmpdir}/%{name}-%{version}-root-%(id -u -n)
 
-%define		_libdir			/%{_lib}
 %define		_sbindir		/sbin
-%define		_sysconfdir		/etc/%{name}
 
 %description
 upstart is a replacement for the /sbin/init daemon which handles
@@ -66,13 +64,13 @@ rm -rf $RPM_BUILD_ROOT
 %files -f upstart.lang
 %defattr(644,root,root,755)
 %doc AUTHORS ChangeLog HACKING NEWS TODO
-%dir %{_sysconfdir}
-%dir %{_sysconfdir}/event.d
-%{_sysconfdir}/event.d/logd
+%{_sysconfdir}/dbus-1/system.d/Upstart.conf
+%dir %{_sysconfdir}/init
+%dir %{_sysconfdir}/init/conf.d
+%dir %{_sysconfdir}/init/jobs.d
 %attr(755,root,root) %{_sbindir}/halt
 %attr(755,root,root) %{_sbindir}/init
 %attr(755,root,root) %{_sbindir}/initctl
-%attr(755,root,root) %{_sbindir}/logd
 %attr(755,root,root) %{_sbindir}/poweroff
 %attr(755,root,root) %{_sbindir}/reboot
 %attr(755,root,root) %{_sbindir}/runlevel
@@ -81,8 +79,4 @@ rm -rf $RPM_BUILD_ROOT
 %attr(755,root,root) %{_sbindir}/status
 %attr(755,root,root) %{_sbindir}/stop
 %attr(755,root,root) %{_sbindir}/telinit
-%attr(755,root,root) %{_libdir}/libnih.so.*.*.*
-%attr(755,root,root) %ghost %{_libdir}/libnih.so.0
-%attr(755,root,root) %{_libdir}/libupstart.so.*.*.*
-%attr(755,root,root) %ghost %{_libdir}/libupstart.so.0
 %{_mandir}/man8/*.8*
