@@ -2,11 +2,12 @@ Summary:	Event-based init daemon
 Summary(pl.UTF-8):	Oparty na zdarzeniach demon init
 Name:		upstart
 Version:	0.5.0
-Release:	2
+Release:	3
 License:	GPL v2
 Group:		Base
 Source0:	http://edge.launchpad.net/upstart/0.5/%{version}/+download/%{name}-%{version}.tar.gz
 # Source0-md5:	df5e2db549b6ebf406d48419831a66b8
+Patch0:		%{name}-oomfail.patch
 URL:		https://launchpad.net/upstart
 BuildRequires:	autoconf >= 2.59
 BuildRequires:	automake >= 1:1.9
@@ -34,6 +35,7 @@ podczas wyłączania systemu, a także nadzorowaniem ich pracy.
 
 %prep
 %setup -q
+%patch0 -p1
 
 %build
 %{__aclocal} -I m4
