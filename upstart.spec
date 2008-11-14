@@ -2,12 +2,13 @@ Summary:	Event-based init daemon
 Summary(pl.UTF-8):	Oparty na zdarzeniach demon init
 Name:		upstart
 Version:	0.5.0
-Release:	3
+Release:	4
 License:	GPL v2
 Group:		Base
 Source0:	http://edge.launchpad.net/upstart/0.5/%{version}/+download/%{name}-%{version}.tar.gz
 # Source0-md5:	df5e2db549b6ebf406d48419831a66b8
 Patch0:		%{name}-oomfail.patch
+Patch1:		%{name}-uU.patch
 URL:		https://launchpad.net/upstart
 BuildRequires:	autoconf >= 2.59
 BuildRequires:	automake >= 1:1.9
@@ -36,13 +37,13 @@ podczas wyłączania systemu, a także nadzorowaniem ich pracy.
 %prep
 %setup -q
 %patch0 -p1
+%patch1 -p1
 
 %build
 %{__aclocal} -I m4
 %{__autoconf}
 %{__automake}
-%configure \
-	--enable-compat
+%configure
 %{__make}
 
 %install
@@ -61,8 +62,14 @@ rm -rf $RPM_BUILD_ROOT%{_aclocaldir}
 %clean
 rm -rf $RPM_BUILD_ROOT
 
-%post	-p /sbin/ldconfig
+%post
+/sbin/ldconfig
+/sbin/telinit u || :
+
 %postun	-p /sbin/ldconfig
+
+%triggerpostun -- glibc
+/sbin/telinit u || :
 
 %files -f upstart.lang
 %defattr(644,root,root,755)
