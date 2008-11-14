@@ -17,6 +17,7 @@ BuildRequires:	gcc >= 5:4.0
 BuildRequires:	gettext >= 0.14.5
 BuildRequires:	glibc-headers >= 6:2.4.0
 BuildRequires:	libtool >= 2:1.5.22
+BuildRequires:	pkgconfig
 Provides:	virtual(init-daemon)
 Obsoletes:	virtual(init-daemon)
 Suggests:	dbus
