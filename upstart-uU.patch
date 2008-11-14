@@ -1,0 +1,23 @@
+--- upstart-0.5.0/util/telinit.c.org	2008-11-14 18:46:51.809375316 +0100
++++ upstart-0.5.0/util/telinit.c	2008-11-14 18:54:52.565993574 +0100
+@@ -28,6 +28,9 @@
+ #include <string.h>
+ #include <unistd.h>
+ 
++#include <sys/types.h>
++#include <signal.h>
++
+ #include <nih/macros.h>
+ #include <nih/alloc.h>
+ #include <nih/string.h>
+@@ -111,6 +114,10 @@
+ 	case 's':
+ 		args[0][0] = 'S';
+ 		break;
++	case 'u':
++	case 'U':
++		exit(kill(1, SIGTERM));
++		break;
+ 	default:
+ 		/* Ignore other arguments */
+ 		exit (0);
