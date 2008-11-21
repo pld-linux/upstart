@@ -1,3 +1,4 @@
+%bcond_without	tests
 Summary:	Event-based init daemon
 Summary(pl.UTF-8):	Oparty na zdarzeniach demon init
 Name:		upstart
@@ -47,6 +48,8 @@ podczas wyłączania systemu, a także nadzorowaniem ich pracy.
 %{__automake}
 %configure
 %{__make}
+
+%{?with_tests:%{__make} check}
 
 %install
 rm -rf $RPM_BUILD_ROOT
