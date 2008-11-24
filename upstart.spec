@@ -1,4 +1,7 @@
-%bcond_without	tests
+#
+# Conditional build:
+%bcond_without	tests	# don't perform "make check"
+#
 Summary:	Event-based init daemon
 Summary(pl.UTF-8):	Oparty na zdarzeniach demon init
 Name:		upstart
@@ -19,10 +22,10 @@ BuildRequires:	gettext >= 0.14.5
 BuildRequires:	glibc-headers >= 6:2.4.0
 BuildRequires:	libtool >= 2:1.5.22
 BuildRequires:	pkgconfig
-Provides:	virtual(init-daemon)
-Obsoletes:	virtual(init-daemon)
 Requires:	dbus-libs >= 1.2.4-3
 Suggests:	dbus
+Provides:	virtual(init-daemon)
+Obsoletes:	virtual(init-daemon)
 BuildRoot:	%{tmpdir}/%{name}-%{version}-root-%(id -u -n)
 
 %define		_sbindir		/sbin
