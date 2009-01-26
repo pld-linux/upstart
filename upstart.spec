@@ -6,7 +6,7 @@ Summary:	Event-based init daemon
 Summary(pl.UTF-8):	Oparty na zdarzeniach demon init
 Name:		upstart
 Version:	0.5.0
-Release:	5
+Release:	6
 License:	GPL v2
 Group:		Base
 Source0:	http://edge.launchpad.net/upstart/0.5/%{version}/+download/%{name}-%{version}.tar.gz
@@ -24,6 +24,7 @@ BuildRequires:	libtool >= 2:1.5.22
 BuildRequires:	pkgconfig
 Requires:	dbus-libs >= 1.2.4-3
 Suggests:	dbus
+Conflicts:	dbus < 1.2.12-2
 Provides:	virtual(init-daemon)
 Obsoletes:	virtual(init-daemon)
 BuildRoot:	%{tmpdir}/%{name}-%{version}-root-%(id -u -n)
