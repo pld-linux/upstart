@@ -5,18 +5,17 @@
 Summary:	Event-based init daemon
 Summary(pl.UTF-8):	Oparty na zdarzeniach demon init
 Name:		upstart
-Version:	0.5.0
-Release:	6
+Version:	0.5.2
+Release:	1
 License:	GPL v2
 Group:		Base
 Source0:	http://edge.launchpad.net/upstart/0.5/%{version}/+download/%{name}-%{version}.tar.gz
-# Source0-md5:	df5e2db549b6ebf406d48419831a66b8
-Patch0:		%{name}-oomfail.patch
-Patch1:		%{name}-uU.patch
+# Source0-md5:	f3efd562dd5ce6fc28d2cdb95ee616b2
+Patch0:		%{name}-bzr.patch
 URL:		https://launchpad.net/upstart
 BuildRequires:	autoconf >= 2.59
 BuildRequires:	automake >= 1:1.9
-BuildRequires:	dbus-devel
+BuildRequires:	dbus-devel >= 1.2.14-2
 BuildRequires:	gcc >= 5:4.0
 BuildRequires:	gettext >= 0.14.5
 BuildRequires:	glibc-headers >= 6:2.4.0
@@ -43,8 +42,7 @@ podczas wyłączania systemu, a także nadzorowaniem ich pracy.
 
 %prep
 %setup -q
-%patch0 -p1
-%patch1 -p1
+%patch0 -p0
 
 %build
 %{__aclocal} -I m4
@@ -98,4 +96,5 @@ rm -rf $RPM_BUILD_ROOT
 %attr(755,root,root) %{_sbindir}/status
 %attr(755,root,root) %{_sbindir}/stop
 %attr(755,root,root) %{_sbindir}/telinit
+%{_mandir}/man1/*.1*
 %{_mandir}/man8/*.8*
