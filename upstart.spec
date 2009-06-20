@@ -6,7 +6,7 @@ Summary:	Event-based init daemon
 Summary(pl.UTF-8):	Oparty na zdarzeniach demon init
 Name:		upstart
 Version:	0.5.2
-Release:	2
+Release:	3
 License:	GPL v2
 Group:		Base
 Source0:	http://edge.launchpad.net/upstart/0.5/%{version}/+download/%{name}-%{version}.tar.gz
