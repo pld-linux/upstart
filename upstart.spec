@@ -82,6 +82,7 @@ rm -rf $RPM_BUILD_ROOT
 %doc AUTHORS ChangeLog HACKING NEWS TODO
 %{_sysconfdir}/dbus-1/system.d/Upstart.conf
 %dir %{_sysconfdir}/init
+%config(noreplace) %verify(not md5 mtime size) %{_sysconfdir}/init/*.conf
 %attr(755,root,root) %{_sbindir}/halt
 %attr(755,root,root) %{_sbindir}/init
 %attr(755,root,root) %{_sbindir}/initctl
