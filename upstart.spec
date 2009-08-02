@@ -5,16 +5,17 @@
 Summary:	Event-based init daemon
 Summary(pl.UTF-8):	Oparty na zdarzeniach demon init
 Name:		upstart
-Version:	0.5.3
-Release:	1
-License:	GPL v3
+Version:	0.6.3
+Release:	0.1
+License:	GPL v2
 Group:		Base
-Source0:	http://edge.launchpad.net/upstart/0.5/%{version}/+download/%{name}-%{version}.tar.gz
-# Source0-md5:	28be02494d810f75438d42fd8bc0a005
+Source0:	http://edge.launchpad.net/upstart/0.6/%{version}/+download/%{name}-%{version}.tar.gz
+# Source0-md5:	55418b2162a06b9f70223dfdb7a95cea
 URL:		https://launchpad.net/upstart
 BuildRequires:	autoconf >= 2.59
 BuildRequires:	automake >= 1:1.9
-BuildRequires:	dbus-devel >= 1.2.14-2
+BuildRequires:	dbus-devel >= 1.2.16-1
+BuildRequires:	expat-devel
 BuildRequires:	gcc >= 5:4.0
 BuildRequires:	gettext >= 0.14.5
 BuildRequires:	glibc-headers >= 6:2.4.0
@@ -81,18 +82,18 @@ rm -rf $RPM_BUILD_ROOT
 %doc AUTHORS ChangeLog HACKING NEWS TODO
 %{_sysconfdir}/dbus-1/system.d/Upstart.conf
 %dir %{_sysconfdir}/init
-%dir %{_sysconfdir}/init/conf.d
-%dir %{_sysconfdir}/init/jobs.d
 %attr(755,root,root) %{_sbindir}/halt
 %attr(755,root,root) %{_sbindir}/init
 %attr(755,root,root) %{_sbindir}/initctl
 %attr(755,root,root) %{_sbindir}/poweroff
 %attr(755,root,root) %{_sbindir}/reboot
+%attr(755,root,root) %{_sbindir}/restart
 %attr(755,root,root) %{_sbindir}/runlevel
 %attr(755,root,root) %{_sbindir}/shutdown
 %attr(755,root,root) %{_sbindir}/start
 %attr(755,root,root) %{_sbindir}/status
 %attr(755,root,root) %{_sbindir}/stop
 %attr(755,root,root) %{_sbindir}/telinit
-%{_mandir}/man1/*.1*
+%{_mandir}/man5/*.5*
+%{_mandir}/man7/*.7*
 %{_mandir}/man8/*.8*
