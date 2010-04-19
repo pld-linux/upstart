@@ -1,20 +1,21 @@
 #
 # Conditional build:
 %bcond_without	tests	# don't perform "make check"
-#
+
 Summary:	Event-based init daemon
 Summary(pl.UTF-8):	Oparty na zdarzeniach demon init
 Name:		upstart
-Version:	0.6.3
-Release:	0.1
+Version:	0.6.5
+Release:	1
 License:	GPL v2
 Group:		Base
-Source0:	http://edge.launchpad.net/upstart/0.6/%{version}/+download/%{name}-%{version}.tar.gz
-# Source0-md5:	55418b2162a06b9f70223dfdb7a95cea
-URL:		https://launchpad.net/upstart
+Source0:        http://upstart.ubuntu.com/download/0.6/upstart-%{version}.tar.gz
+# Source0-md5:	f9466bba72b655c2408353b64105853f
+URL:            http://upstart.ubuntu.com/
 BuildRequires:	autoconf >= 2.59
 BuildRequires:	automake >= 1:1.9
 BuildRequires:	dbus-devel >= 1.2.16-1
+BuildRequires:	libnih-devel >= 1.0.1
 BuildRequires:	expat-devel
 BuildRequires:	gcc >= 5:4.0
 BuildRequires:	gettext >= 0.14.5
@@ -88,6 +89,7 @@ rm -rf $RPM_BUILD_ROOT
 %attr(755,root,root) %{_sbindir}/initctl
 %attr(755,root,root) %{_sbindir}/poweroff
 %attr(755,root,root) %{_sbindir}/reboot
+%attr(755,root,root) %{_sbindir}/reload
 %attr(755,root,root) %{_sbindir}/restart
 %attr(755,root,root) %{_sbindir}/runlevel
 %attr(755,root,root) %{_sbindir}/shutdown
