@@ -1,19 +1,12 @@
---- upstart-0.6.5/conf/rc.conf~	2009-10-23 23:47:27.000000000 +0300
-+++ upstart-0.6.5/conf/rc.conf	2010-04-20 08:02:17.867240857 +0300
-@@ -15,4 +15,4 @@
- task
+--- upstart-0.6.5/conf/Makefile.am~	2009-10-23 23:47:27.000000000 +0300
++++ upstart-0.6.5/conf/Makefile.am	2010-04-20 20:57:19.482479946 +0300
+@@ -2,7 +2,6 @@
  
- console output
--exec /etc/init.d/rc $RUNLEVEL
-+exec /etc/rc.d/rc $RUNLEVEL
---- upstart-0.6.5/conf/rc-sysinit.conf~	2010-02-04 05:58:39.000000000 +0200
-+++ upstart-0.6.5/conf/rc-sysinit.conf	2010-04-20 08:04:26.690246472 +0300
-@@ -51,7 +51,7 @@
-     done
- 
-     # Run the system initialisation scripts
--    [ -n "${FROM_SINGLE_USER_MODE}" ] || /etc/init.d/rcS
-+    [ -n "${FROM_SINGLE_USER_MODE}" ] || /etc/init.d/single start
- 
-     # Switch into the default runlevel
-     telinit "${DEFAULT_RUNLEVEL}"
+ initdir = $(sysconfdir)/init
+ dist_init_DATA = \
+-	rc-sysinit.conf \
+-	rc.conf \
+-	rcS.conf \
++	start-ttys.conf \
++	tty.conf \
+ 	control-alt-delete.conf

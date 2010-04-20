@@ -8,13 +8,15 @@ Summary:	Event-based init daemon
 Summary(pl.UTF-8):	Oparty na zdarzeniach demon init
 Name:		upstart
 Version:	0.6.5
-Release:	1
+Release:	1.4
 License:	GPL v2
 Group:		Base
 Source0:	http://upstart.ubuntu.com/download/0.6/%{name}-%{version}.tar.gz
 # Source0-md5:	f9466bba72b655c2408353b64105853f
 URL:		http://upstart.ubuntu.com/
-Patch0:		rc-scripts-paths.patch
+Patch0:		pldize.patch
+Source1:	start-ttys.conf
+Source2:	tty.conf
 BuildRequires:	autoconf >= 2.59
 BuildRequires:	automake >= 1:1.9
 BuildRequires:	dbus-devel >= 1.2.16-1
@@ -27,10 +29,11 @@ BuildRequires:	libtool >= 2:1.5.22
 BuildRequires:	pkgconfig
 Requires:	dbus-libs >= 1.2.14-2
 Suggests:	dbus
+Suggests:	vim-syntax-upstart
 Provides:	virtual(init-daemon)
 Obsoletes:	virtual(init-daemon)
 Conflicts:	dbus < 1.2.12-2
-Conflicts:	upstart-SysVinit < 2.86-23
+Conflicts:	upstart-SysVinit < 2.86-23.2
 BuildRoot:	%{tmpdir}/%{name}-%{version}-root-%(id -u -n)
 
 %define		_sbindir		/sbin
@@ -48,6 +51,8 @@ podczas wyłączania systemu, a także nadzorowaniem ich pracy.
 %prep
 %setup -q
 %patch0 -p1
+cp -a %{SOURCE1} conf
+cp -a %{SOURCE2} conf
 
 %build
 %{__aclocal} -I m4
@@ -91,7 +96,9 @@ rm -rf $RPM_BUILD_ROOT
 %doc AUTHORS ChangeLog HACKING NEWS TODO
 /etc/dbus-1/system.d/Upstart.conf
 %dir %{_sysconfdir}/init
-%config(noreplace) %verify(not md5 mtime size) %{_sysconfdir}/init/*.conf
+%config(noreplace) %verify(not md5 mtime size) %{_sysconfdir}/init/control-alt-delete.conf
+%config(noreplace) %verify(not md5 mtime size) %{_sysconfdir}/init/start-ttys.conf
+%config(noreplace) %verify(not md5 mtime size) %{_sysconfdir}/init/tty.conf
 %attr(755,root,root) %{_sbindir}/halt
 %attr(755,root,root) %{_sbindir}/init
 %attr(755,root,root) %{_sbindir}/initctl
