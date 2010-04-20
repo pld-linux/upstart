@@ -1,6 +1,8 @@
+# TODO
+# - 2 of 13 tests failed
 #
 # Conditional build:
-%bcond_without	tests	# don't perform "make check"
+%bcond_with	tests	# don't perform "make check"
 
 Summary:	Event-based init daemon
 Summary(pl.UTF-8):	Oparty na zdarzeniach demon init
@@ -9,24 +11,26 @@ Version:	0.6.5
 Release:	1
 License:	GPL v2
 Group:		Base
-Source0:        http://upstart.ubuntu.com/download/0.6/upstart-%{version}.tar.gz
+Source0:	http://upstart.ubuntu.com/download/0.6/%{name}-%{version}.tar.gz
 # Source0-md5:	f9466bba72b655c2408353b64105853f
-URL:            http://upstart.ubuntu.com/
+URL:		http://upstart.ubuntu.com/
+Patch0:		rc-scripts-paths.patch
 BuildRequires:	autoconf >= 2.59
 BuildRequires:	automake >= 1:1.9
 BuildRequires:	dbus-devel >= 1.2.16-1
-BuildRequires:	libnih-devel >= 1.0.1
 BuildRequires:	expat-devel
 BuildRequires:	gcc >= 5:4.0
 BuildRequires:	gettext >= 0.14.5
 BuildRequires:	glibc-headers >= 6:2.4.0
+BuildRequires:	libnih-devel >= 1.0.1
 BuildRequires:	libtool >= 2:1.5.22
 BuildRequires:	pkgconfig
 Requires:	dbus-libs >= 1.2.14-2
 Suggests:	dbus
-Conflicts:	dbus < 1.2.12-2
 Provides:	virtual(init-daemon)
 Obsoletes:	virtual(init-daemon)
+Conflicts:	dbus < 1.2.12-2
+Conflicts:	upstart-SysVinit < 2.86-23
 BuildRoot:	%{tmpdir}/%{name}-%{version}-root-%(id -u -n)
 
 %define		_sbindir		/sbin
@@ -43,6 +47,7 @@ podczas wyłączania systemu, a także nadzorowaniem ich pracy.
 
 %prep
 %setup -q
+%patch0 -p1
 
 %build
 %{__aclocal} -I m4
@@ -78,10 +83,13 @@ rm -rf $RPM_BUILD_ROOT
 %triggerpostun -- glibc
 /sbin/telinit u || :
 
+%triggerpostun -- upstart < 0.6.0
+[ -f /proc/1/exe -a -d /proc/1/root ] && kill -TERM 1
+
 %files -f upstart.lang
 %defattr(644,root,root,755)
 %doc AUTHORS ChangeLog HACKING NEWS TODO
-%{_sysconfdir}/dbus-1/system.d/Upstart.conf
+/etc/dbus-1/system.d/Upstart.conf
 %dir %{_sysconfdir}/init
 %config(noreplace) %verify(not md5 mtime size) %{_sysconfdir}/init/*.conf
 %attr(755,root,root) %{_sbindir}/halt
