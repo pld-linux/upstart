@@ -8,7 +8,7 @@ Summary:	Event-based init daemon
 Summary(pl.UTF-8):	Oparty na zdarzeniach demon init
 Name:		upstart
 Version:	0.6.5
-Release:	1.4
+Release:	1.6
 License:	GPL v2
 Group:		Base
 Source0:	http://upstart.ubuntu.com/download/0.6/%{name}-%{version}.tar.gz
@@ -17,6 +17,7 @@ URL:		http://upstart.ubuntu.com/
 Patch0:		pldize.patch
 Source1:	start-ttys.conf
 Source2:	tty.conf
+Source3:	upstart.sysconfig
 BuildRequires:	autoconf >= 2.59
 BuildRequires:	automake >= 1:1.9
 BuildRequires:	dbus-devel >= 1.2.16-1
@@ -65,11 +66,14 @@ cp -a %{SOURCE2} conf
 
 %install
 rm -rf $RPM_BUILD_ROOT
+install -d $RPM_BUILD_ROOT/etc/sysconfig
 
 %{__make} install \
 	DESTDIR=$RPM_BUILD_ROOT
 
 %find_lang upstart
+
+cp -a %{SOURCE3} $RPM_BUILD_ROOT/etc/sysconfig/%{name}
 
 # no -devel
 rm -rf $RPM_BUILD_ROOT%{_includedir}
@@ -95,6 +99,7 @@ rm -rf $RPM_BUILD_ROOT
 %defattr(644,root,root,755)
 %doc AUTHORS ChangeLog HACKING NEWS TODO
 /etc/dbus-1/system.d/Upstart.conf
+%config(noreplace) %verify(not md5 mtime size) /etc/sysconfig/%{name}
 %dir %{_sysconfdir}/init
 %config(noreplace) %verify(not md5 mtime size) %{_sysconfdir}/init/control-alt-delete.conf
 %config(noreplace) %verify(not md5 mtime size) %{_sysconfdir}/init/start-ttys.conf
