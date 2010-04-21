@@ -1,0 +1,9 @@
+# $Id$
+
+# Override which consoles to spawn
+# See /etc/init/start-ttys.conf
+ACTIVE_CONSOLES=/dev/tty[1-4]
+
+# on which console NOT to start mingetty on runlevel 5 which is usually occupied by xdm/kdm/gdm.
+# See /etc/init/start-ttys.conf.
+X_TTY=/dev/tty5
