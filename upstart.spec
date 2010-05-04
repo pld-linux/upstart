@@ -18,6 +18,7 @@ Patch0:		pldize.patch
 Source1:	start-ttys.conf
 Source2:	tty.conf
 Source3:	%{name}.sysconfig
+Source4:	%{name}-job
 BuildRequires:	autoconf >= 2.59
 BuildRequires:	automake >= 1:1.9
 BuildRequires:	dbus-devel >= 1.2.16-1
@@ -32,6 +33,7 @@ BuildRequires:	rpmbuild(macros) >= 1.402
 Requires:	dbus-libs >= 1.2.14-2
 Suggests:	dbus
 Suggests:	vim-syntax-upstart
+Provides:	upstart-job
 Provides:	virtual(init-daemon)
 Obsoletes:	virtual(init-daemon)
 Conflicts:	dbus < 1.2.12-2
@@ -67,7 +69,7 @@ cp -a %{SOURCE2} conf
 
 %install
 rm -rf $RPM_BUILD_ROOT
-install -d $RPM_BUILD_ROOT/etc/sysconfig
+install -d $RPM_BUILD_ROOT{/etc/sysconfig,/lib/init}
 
 %{__make} install \
 	DESTDIR=$RPM_BUILD_ROOT
@@ -75,6 +77,7 @@ install -d $RPM_BUILD_ROOT/etc/sysconfig
 %find_lang upstart
 
 cp -a %{SOURCE3} $RPM_BUILD_ROOT/etc/sysconfig/%{name}
+install -p %{SOURCE4} $RPM_BUILD_ROOT/lib/init
 
 # no -devel
 rm -rf $RPM_BUILD_ROOT%{_includedir}
@@ -118,6 +121,8 @@ rm -rf $RPM_BUILD_ROOT
 %attr(755,root,root) %{_sbindir}/status
 %attr(755,root,root) %{_sbindir}/stop
 %attr(755,root,root) %{_sbindir}/telinit
+%dir /lib/init
+%attr(755,root,root) /lib/init/upstart-job
 %{_mandir}/man5/*.5*
 %{_mandir}/man7/*.7*
 %{_mandir}/man8/*.8*
