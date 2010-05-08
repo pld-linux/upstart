@@ -33,7 +33,6 @@ BuildRequires:	rpmbuild(macros) >= 1.402
 Requires:	dbus-libs >= 1.2.14-2
 Suggests:	dbus
 Suggests:	vim-syntax-upstart
-Provides:	upstart-job
 Provides:	virtual(init-daemon)
 Obsoletes:	virtual(init-daemon)
 Conflicts:	dbus < 1.2.12-2
@@ -122,7 +121,6 @@ rm -rf $RPM_BUILD_ROOT
 %attr(755,root,root) %{_sbindir}/stop
 %attr(755,root,root) %{_sbindir}/telinit
 %dir /lib/init
-%attr(755,root,root) /lib/init/upstart-job
 %{_mandir}/man5/*.5*
 %{_mandir}/man7/*.7*
 %{_mandir}/man8/*.8*
