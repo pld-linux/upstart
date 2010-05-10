@@ -18,7 +18,6 @@ Patch0:		pldize.patch
 Source1:	start-ttys.conf
 Source2:	tty.conf
 Source3:	%{name}.sysconfig
-Source4:	%{name}-job
 BuildRequires:	autoconf >= 2.59
 BuildRequires:	automake >= 1:1.9
 BuildRequires:	dbus-devel >= 1.2.16-1
@@ -77,7 +76,6 @@ install -d $RPM_BUILD_ROOT{/etc/sysconfig,/lib/init}
 %find_lang upstart
 
 cp -a %{SOURCE3} $RPM_BUILD_ROOT/etc/sysconfig/%{name}
-install -p %{SOURCE4} $RPM_BUILD_ROOT/lib/init
 
 # no -devel
 rm -rf $RPM_BUILD_ROOT%{_includedir}
