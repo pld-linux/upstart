@@ -8,7 +8,7 @@ Summary:	Event-based init daemon
 Summary(pl.UTF-8):	Oparty na zdarzeniach demon init
 Name:		upstart
 Version:	0.6.6
-Release:	1
+Release:	2
 License:	GPL v2
 Group:		Base
 Source0:	http://upstart.ubuntu.com/download/0.6/%{name}-%{version}.tar.gz
@@ -31,6 +31,7 @@ BuildRequires:	libtool >= 2:1.5.22
 BuildRequires:	pkgconfig
 BuildRequires:	rpmbuild(macros) >= 1.402
 Requires:	dbus-libs >= 1.2.14-2
+Requires:	filesystem >= 3.0-35
 Suggests:	dbus
 Suggests:	vim-syntax-upstart
 Provides:	virtual(init-daemon)
@@ -103,7 +104,6 @@ rm -rf $RPM_BUILD_ROOT
 %doc AUTHORS ChangeLog HACKING NEWS TODO
 /etc/dbus-1/system.d/Upstart.conf
 %config(noreplace) %verify(not md5 mtime size) /etc/sysconfig/%{name}
-%dir %{_sysconfdir}/init
 %config(noreplace) %verify(not md5 mtime size) %{_sysconfdir}/init/control-alt-delete.conf
 %config(noreplace) %verify(not md5 mtime size) %{_sysconfdir}/init/start-ttys.conf
 %config(noreplace) %verify(not md5 mtime size) %{_sysconfdir}/init/tty.conf
