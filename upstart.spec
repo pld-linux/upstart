@@ -1,5 +1,5 @@
 # TODO
-# - 2 of 13 tests failed
+# - 4 of 13 tests failed (3 with 'permission denied')
 #
 # Conditional build:
 %bcond_with	tests	# don't perform "make check"
