@@ -2,19 +2,22 @@
 # - 4 of 13 tests failed (3 with 'permission denied')
 #
 # Conditional build:
-%bcond_with	tests	# don't perform "make check"
+%bcond_with	statesave	# state-save experimental patch
+%bcond_with	tests		# don't perform "make check"
 
 Summary:	Event-based init daemon
 Summary(pl.UTF-8):	Oparty na zdarzeniach demon init
 Name:		upstart
 Version:	0.6.6
-Release:	2
+Release:	3
 License:	GPL v2
 Group:		Base
 Source0:	http://upstart.ubuntu.com/download/0.6/%{name}-%{version}.tar.gz
 # Source0-md5:	5a2e9962a4cea719fbe07c33e2591b06
 URL:		http://upstart.ubuntu.com/
 Patch0:		pldize.patch
+# https://code.launchpad.net/~jajcus-jajcus/upstart/state-save-stable/+merge/27053/+preview-diff/+files/preview.diff
+Patch1:		%{name}-state_save.patch
 Source1:	start-ttys.conf
 Source2:	tty.conf
 Source3:	%{name}.sysconfig
@@ -54,6 +57,7 @@ podczas wyłączania systemu, a także nadzorowaniem ich pracy.
 %prep
 %setup -q
 %patch0 -p1
+%{?with_statesave:%patch1 -p0}
 cp -a %{SOURCE1} conf
 cp -a %{SOURCE2} conf
 

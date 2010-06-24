@@ -1,0 +1,7009 @@
+=== modified file 'configure.ac'
+--- configure.ac	2010-04-27 19:48:44 +0000
++++ configure.ac	2010-06-08 13:33:50 +0000
+@@ -21,6 +21,8 @@
+ # Checks for programs.
+ AC_PROG_CC
+ PKG_PROG_PKG_CONFIG([0.22])
++AM_PROG_LEX
++AC_PROG_YACC
+ 
+ AC_PATH_PROG([NIH_DBUS_TOOL], [nih-dbus-tool])
+ 
+@@ -40,6 +42,7 @@
+ NIH_C_THREAD
+ 
+ # Checks for library functions.
++AC_CHECK_FUNCS([fmemopen])
+ 
+ # Other checks
+ AC_MSG_CHECKING([whether to include sbindir in PATH])
+
+=== modified file 'init/Makefile.am'
+--- init/Makefile.am	2010-02-04 03:42:29 +0000
++++ init/Makefile.am	2010-06-08 13:33:50 +0000
+@@ -48,7 +48,11 @@
+ 	blocked.c blocked.h \
+ 	parse_job.c parse_job.h \
+ 	parse_conf.c parse_conf.h \
++	save_state.c save_state.h \
++	load_state.c load_state.h \
++	state_lexer.l state_parser.y \
+ 	conf.c conf.h \
++	reexec.c reexec.h \
+ 	control.c control.h \
+ 	errors.h
+ nodist_init_SOURCES = \
+@@ -62,6 +66,7 @@
+ 	$(DBUS_LIBS) \
+ 	-lrt
+ 
++AM_YFLAGS = -d -v
+ 
+ com_ubuntu_Upstart_OUTPUTS = \
+ 	com.ubuntu.Upstart.c \
+@@ -113,7 +118,9 @@
+ BUILT_SOURCES = \
+ 	$(com_ubuntu_Upstart_OUTPUTS) \
+ 	$(com_ubuntu_Upstart_Job_OUTPUTS) \
+-	$(com_ubuntu_Upstart_Instance_OUTPUTS)
++	$(com_ubuntu_Upstart_Instance_OUTPUTS) \
++	state_lexer.c \
++	state_parser.c state_parser.h 
+ 
+ CLEANFILES = \
+ 	$(com_ubuntu_Upstart_OUTPUTS) \
+@@ -125,6 +132,9 @@
+ 
+ 
+ TESTS = \
++	test_state_parser \
++	test_save_state \
++	test_load_state \
+ 	test_system \
+ 	test_environ \
+ 	test_process \
+@@ -143,6 +153,36 @@
+ 
+ tests: $(BUILT_SOURCES) $(check_PROGRAMS)
+ 
++test_save_state_SOURCES = tests/test_save_state.c
++test_save_state_LDADD = \
++	system.o environ.o process.o \
++	job_class.o job_process.o job.o event.o event_operator.o blocked.o \
++	parse_job.o parse_conf.o conf.o control.o \
++	com.ubuntu.Upstart.o \
++	com.ubuntu.Upstart.Job.o com.ubuntu.Upstart.Instance.o \
++	save_state.o \
++	$(NIH_LIBS) \
++	$(NIH_DBUS_LIBS) \
++	$(DBUS_LIBS)
++
++test_load_state_SOURCES = tests/test_load_state.c
++test_load_state_LDADD = \
++	system.o environ.o process.o \
++	job_class.o job_process.o job.o event.o event_operator.o blocked.o \
++	parse_job.o parse_conf.o conf.o control.o \
++	com.ubuntu.Upstart.o \
++	com.ubuntu.Upstart.Job.o com.ubuntu.Upstart.Instance.o \
++	load_state.o state_parser.o state_lexer.o \
++	$(NIH_LIBS) \
++	$(NIH_DBUS_LIBS) \
++	$(DBUS_LIBS)
++
++test_state_parser_SOURCES = tests/test_state_parser.c
++test_state_parser_LDADD = \
++	state_parser.o \
++	state_lexer.o \
++	$(NIH_LIBS)
++
+ test_system_SOURCES = tests/test_system.c
+ test_system_LDADD = \
+ 	system.o \
+
+=== modified file 'init/control.c'
+--- init/control.c	2009-07-11 11:47:12 +0000
++++ init/control.c	2010-06-08 13:33:50 +0000
+@@ -59,6 +59,9 @@
+ static int   control_server_connect (DBusServer *server, DBusConnection *conn);
+ static void  control_disconnected   (DBusConnection *conn);
+ static void  control_register_all   (DBusConnection *conn);
++static void  control_unregister_all (DBusConnection *conn);
++DBusHandlerResult control_call_rejecting_filter(DBusConnection *connection,
++	                             DBusMessage *message, void *user_data);
+ 
+ 
+ /**
+@@ -231,7 +234,8 @@
+ 
+ 		dbus_connection_unref (conn);
+ 		return -1;
+-	} else if (ret != DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER) {
++	} else if (ret != DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER
++			&& ret != DBUS_REQUEST_NAME_REPLY_ALREADY_OWNER) {
+ 		/* Failed to obtain the name (already taken usually) */
+ 		nih_error_raise (CONTROL_NAME_TAKEN,
+ 				 _(CONTROL_NAME_TAKEN_STR));
+@@ -267,11 +271,152 @@
+ {
+ 	nih_assert (control_bus != NULL);
+ 
++	/* Unregister all objects, so control_bus_open() may be called again */
++	control_unregister_all(control_bus);
++
+ 	dbus_connection_unref (control_bus);
+ 
+ 	control_disconnected (control_bus);
+ }
+ 
++/**
++ * control_close_all_conns:
++ *
++ * Close all control connections.
++ **/
++void
++control_close_all_conns (void)
++{
++	nih_assert (control_conns != NULL);
++
++	NIH_LIST_FOREACH(control_conns, iter) {
++		NihListEntry *entry = (NihListEntry *)iter;
++		DBusConnection *conn = (DBusConnection *)entry->data;
++		dbus_connection_close(conn);
++	}
++}
++
++typedef struct call_rejection_details {
++	char * error_name;
++	char * message;
++} CallRejectionDetails;
++
++CallRejectionDetails *rejection_details = NULL;
++
++/**
++ * control_reject_calls:
++ *
++ * Add a filter to all connections to reject any incoming method calls.
++ **/
++void 
++control_reject_calls (const char * error_name, const char * message) 
++{
++
++	nih_assert(rejection_details == NULL);
++
++	rejection_details = nih_new(NULL, CallRejectionDetails);
++	if (rejection_details == NULL) {
++		nih_warn(_("Could not set DBus call rejecting filter"));
++		return;
++	}
++	rejection_details->error_name = nih_strdup(rejection_details,
++			                           error_name);
++	if (rejection_details->error_name == NULL) {
++		nih_warn(_("Could not set DBus call rejecting filter"));
++		nih_free(rejection_details);
++		rejection_details = NULL;
++		return;
++	}
++	rejection_details->message = nih_strdup(rejection_details,
++			                        message);
++	if (rejection_details->message == NULL) {
++		nih_warn(_("Could not set DBus call rejecting filter"));
++		nih_free(rejection_details);
++		rejection_details = NULL;
++		return;
++	}
++
++	if (control_bus) {
++		if (!dbus_connection_add_filter (control_bus,
++					    control_call_rejecting_filter,
++					    NULL, NULL)) {
++			nih_warn(_("Could not set DBus call rejecting filter"));
++		}
++	}
++	NIH_LIST_FOREACH(control_conns, iter) {
++		NihListEntry *entry = (NihListEntry *)iter;
++		DBusConnection *conn = (DBusConnection *)entry->data;
++		if (!dbus_connection_add_filter (conn,
++					    control_call_rejecting_filter,
++					    NULL, NULL)) {
++			nih_warn(_("Could not set DBus call rejecting filter"));
++			dbus_connection_close(conn);
++		}
++	}
++}
++
++/**
++ * control_unreject_calls:
++ *
++ * Remove the call rejecting filter from all connections.
++ **/
++void 
++control_unreject_calls (void) 
++{
++
++	nih_assert(rejection_details != NULL);
++	if (control_bus) {
++		dbus_connection_remove_filter (control_bus,
++					    control_call_rejecting_filter,
++					    NULL);
++	}
++	NIH_LIST_FOREACH(control_conns, iter) {
++		NihListEntry *entry = (NihListEntry *)iter;
++		DBusConnection *conn = (DBusConnection *)entry->data;
++		dbus_connection_remove_filter (conn,
++					    control_call_rejecting_filter,
++					    NULL);
++	}
++	nih_discard(rejection_details);
++	rejection_details = NULL;
++}
++
++
++DBusHandlerResult 
++control_call_rejecting_filter(DBusConnection *connection,
++	                   DBusMessage *message, void *user_data)
++{
++	DBusMessage *error_message;
++
++	if (rejection_details == NULL) {
++		/* This may happen for the system bus, as libdbus
++		 * never really closes it. When rejection_details are NULL
++		 * it means the filter is not needed any more.
++		 */
++		dbus_connection_remove_filter (connection,
++					    control_call_rejecting_filter,
++					    NULL);
++		return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
++	}
++       	
++	if (dbus_message_get_type(message) != DBUS_MESSAGE_TYPE_METHOD_CALL)
++		return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
++	
++	error_message = dbus_message_new_error (message,
++				rejection_details->error_name,
++				rejection_details->message);
++
++	if (error_message == NULL)
++		return DBUS_HANDLER_RESULT_NEED_MEMORY;
++
++	if (!dbus_connection_send(connection, error_message, NULL)) {
++		dbus_message_unref (error_message);
++		return DBUS_HANDLER_RESULT_NEED_MEMORY;
++	}
++		
++	dbus_message_unref (error_message);
++	return DBUS_HANDLER_RESULT_HANDLED;	
++}
+ 
+ /**
+  * control_disconnected:
+@@ -333,6 +478,35 @@
+ 	}
+ }
+ 
++/**
++ * control_unregister_all:
++ * @conn: connection to unregister objects for.
++ *
++ * Unregisters the manager object and objects for all jobs and instances on
++ * the given connection.
++ **/
++static void
++control_unregister_all (DBusConnection *conn)
++{
++	nih_assert (conn != NULL);
++
++	job_class_init ();
++
++	/* Unregister the control object */
++	NIH_MUST(dbus_connection_unregister_object_path (control_bus,
++				                         DBUS_PATH_UPSTART));
++
++	/* Unregister objects for each currently registered job and its
++	 * instances.
++	 */
++	NIH_HASH_FOREACH (job_classes, iter) {
++		JobClass *class = (JobClass *)iter;
++
++		job_class_unregister (class, conn, FALSE);
++	}
++}
++
++
+ 
+ /**
+  * control_reload_configuration:
+
+=== modified file 'init/control.h'
+--- init/control.h	2009-07-09 08:36:52 +0000
++++ init/control.h	2010-06-08 13:33:50 +0000
+@@ -46,6 +46,10 @@
+ 	__attribute__ ((warn_unused_result));
+ void control_bus_close            (void);
+ 
++void control_close_all_conns	  (void);
++void control_reject_calls	  (const char * error_name, const char * message);
++void control_unreject_calls	  (void);
++
+ int  control_reload_configuration (void *data, NihDBusMessage *message)
+ 	__attribute__ ((warn_unused_result));
+ 
+
+=== modified file 'init/errors.h'
+--- init/errors.h	2009-06-23 09:29:35 +0000
++++ init/errors.h	2010-06-08 13:33:50 +0000
+@@ -48,6 +48,15 @@
+ 	PARSE_EXPECTED_OPERATOR,
+ 	PARSE_EXPECTED_VARIABLE,
+ 	PARSE_MISMATCHED_PARENS,
++	
++	/* Errors while parsing saved state */
++	STATE_PARSE_ERROR,
++
++	/* Errors while loading saved state */
++	LOAD_VALUE_MISSING,
++	LOAD_TYPE_MISMATCH,
++	LOAD_UNRECOGNIZED_VALUE,
++	LOAD_BAD_FORMAT_VERSION,
+ 
+ 	/* Errors while handling control requests */
+ 	CONTROL_NAME_TAKEN,
+@@ -68,6 +77,11 @@
+ #define PARSE_EXPECTED_OPERATOR_STR	N_("Expected operator")
+ #define PARSE_EXPECTED_VARIABLE_STR	N_("Expected variable name before value")
+ #define PARSE_MISMATCHED_PARENS_STR	N_("Mismatched parentheses")
++#define STATE_PARSE_ERROR_STR		N_("Saved state parse error")
+ #define CONTROL_NAME_TAKEN_STR		N_("Name already taken")
++#define	LOAD_VALUE_MISSING_STR		N_("Value missing")
++#define LOAD_TYPE_MISMATCH_STR		N_("Bad type for a field value")
++#define LOAD_UNRECOGNIZED_VALUE_STR	N_("Unrecognized value")
++#define LOAD_BAD_FORMAT_VERSION_STR	N_("Bad format version")
+ 
+ #endif /* INIT_ERRORS_H */
+
+=== modified file 'init/event.c'
+--- init/event.c	2009-07-02 17:31:25 +0000
++++ init/event.c	2010-06-08 13:33:50 +0000
+@@ -60,6 +60,12 @@
+  **/
+ NihList *events = NULL;
+ 
++/**
++ * event_poll_main_func:
++ *
++ * event_poll() callback registered in the NIH main loop.
++ **/
++static NihMainLoopFunc * event_poll_main_func = NULL;
+ 
+ /**
+  * event_init:
+@@ -190,7 +196,6 @@
+ 	event->blockers--;
+ }
+ 
+-
+ /**
+  * event_poll:
+  *
+@@ -252,6 +257,37 @@
+ 	} while (poll_again);
+ }
+ 
++/**
++ * event_register_poll:
++ *
++ * Register event_poll as NIH main loop callback function. Store the registered
++ * function information, so it can be removed from main loop when neccessary
++ * (like on re-exec).
++ **/
++void
++event_register_poll (void) {
++	
++	/* Process the event queue each time through the main loop */
++	event_poll_main_func = NIH_MUST (
++			nih_main_loop_add_func (NULL, (NihMainLoopCb)event_poll,
++					        NULL));
++}
++
++/**
++ * event_unregister_poll:
++ *
++ * Remove event_poll() callback from the NIH main loop. Used during the re-exec
++ * procedure to defer event handling to the new init incarnation.
++ **/
++void
++event_unregister_poll (void) {
++
++	if (event_poll_main_func == NULL)
++		return;
++
++	nih_free(event_poll_main_func);
++	event_poll_main_func = NULL;
++}
+ 
+ /**
+  * event_pending:
+
+=== modified file 'init/event.h'
+--- init/event.h	2009-07-09 08:36:52 +0000
++++ init/event.h	2010-06-08 13:33:50 +0000
+@@ -87,6 +87,8 @@
+ void   event_unblock (Event *event);
+ 
+ void   event_poll    (void);
++void   event_register_poll (void);
++void   event_unregister_poll (void);
+ 
+ NIH_END_EXTERN
+ 
+
+=== modified file 'init/job.c'
+--- init/job.c	2009-07-21 11:27:55 +0000
++++ init/job.c	2010-06-08 13:33:50 +0000
+@@ -184,6 +184,32 @@
+ 							 job->path));
+ }
+ 
++/**
++ * job_unregister:
++ * @job: job to unregister,
++ * @conn: connection to unregister for,
++ * @signal: emit the InstanceRemoved signal.
++ *
++ * Unregister the @job instance from the D-Bus connection @conn, using
++ * the path set when the job was created.
++ **/
++void
++job_unregister (Job            *job,
++	      DBusConnection *conn,
++	      int	     signal)
++{
++	nih_assert (job != NULL);
++	nih_assert (conn != NULL);
++
++	NIH_MUST (dbus_connection_unregister_object_path (conn, job->path));
++
++	nih_debug ("Unregistered instance %s", job->path);
++	if (signal)
++		NIH_ZERO (job_class_emit_instance_removed (conn,
++				             	           job->class->path,
++							   job->path));
++}
++
+ 
+ /**
+  * job_change_goal:
+
+=== modified file 'init/job.h'
+--- init/job.h	2009-07-03 16:38:02 +0000
++++ init/job.h	2010-06-08 13:33:50 +0000
+@@ -158,7 +158,7 @@
+ Job *       job_new             (JobClass *class, const char *name)
+ 	__attribute__ ((warn_unused_result, malloc));
+ void        job_register        (Job *job, DBusConnection *conn, int signal);
+-
++void	    job_unregister      (Job *job, DBusConnection *conn, int signal);
+ void        job_change_goal     (Job *job, JobGoal goal);
+ 
+ void        job_change_state    (Job *job, JobState state);
+
+=== modified file 'init/job_class.c'
+--- init/job_class.c	2009-07-09 11:50:19 +0000
++++ init/job_class.c	2010-06-08 13:33:50 +0000
+@@ -355,7 +355,7 @@
+ 		NihListEntry   *entry = (NihListEntry *)iter;
+ 		DBusConnection *conn = (DBusConnection *)entry->data;
+ 
+-		job_class_unregister (class, conn);
++		job_class_unregister (class, conn, TRUE);
+ 	}
+ 
+ 	return TRUE;
+@@ -401,25 +401,31 @@
+  * job_class_unregister:
+  * @class: class to unregistered,
+  * @conn: connection to unregister from.
++ * @signal: emit the JobRemoved signal
+  *
+  * Unregister the job @class from the D-Bus connection @conn, which must
+  * have already been registered with job_class_register().
+  **/
+ void
+ job_class_unregister (JobClass       *class,
+-		      DBusConnection *conn)
++		      DBusConnection *conn,
++		      int	     signal)
+ {
+ 	nih_assert (class != NULL);
+ 	nih_assert (conn != NULL);
+-	NIH_HASH_FOREACH (class->instances, iter)
+-		nih_assert_not_reached ();
++	NIH_HASH_FOREACH (class->instances, iter) {
++		Job *job = (Job *)iter;
++
++		job_unregister(job, conn, signal);
++	}
+ 
+ 	NIH_MUST (dbus_connection_unregister_object_path (conn, class->path));
+ 
+ 	nih_debug ("Unregistered job %s", class->path);
+ 
+-	NIH_ZERO (control_emit_job_removed (conn, DBUS_PATH_UPSTART,
+-					    class->path));
++	if (signal)
++		NIH_ZERO (control_emit_job_removed (conn, DBUS_PATH_UPSTART,
++					            class->path));
+ }
+ 
+ 
+
+=== modified file 'init/job_class.h'
+--- init/job_class.h	2009-07-09 11:01:53 +0000
++++ init/job_class.h	2010-06-08 13:33:50 +0000
+@@ -167,7 +167,7 @@
+ void        job_class_register             (JobClass *class,
+ 					    DBusConnection *conn, int signal);
+ void        job_class_unregister           (JobClass *class,
+-					    DBusConnection *conn);
++					    DBusConnection *conn, int signal);
+ 
+ char      **job_class_environment          (const void *parent,
+ 					    JobClass *class, size_t *len)
+
+=== modified file 'init/job_process.c'
+--- init/job_process.c	2010-02-26 15:31:13 +0000
++++ init/job_process.c	2010-06-08 13:33:50 +0000
+@@ -87,7 +87,6 @@
+ static int  job_process_error_read      (int fd)
+ 	__attribute__ ((warn_unused_result));
+ 
+-static void job_process_kill_timer      (Job *job, NihTimer *timer);
+ static void job_process_terminated      (Job *job, ProcessType process,
+ 					 int status);
+ static int  job_process_catch_runaway   (Job *job);
+@@ -769,7 +768,7 @@
+  * a particular time of being sent the TERM signal.  The process is killed
+  * more forcibly by sending the KILL signal.
+  **/
+-static void
++void
+ job_process_kill_timer (Job      *job,
+ 			NihTimer *timer)
+ {
+
+=== modified file 'init/job_process.h'
+--- init/job_process.h	2009-07-09 11:01:53 +0000
++++ init/job_process.h	2010-06-08 13:33:50 +0000
+@@ -90,6 +90,8 @@
+ 
+ Job   *job_process_find    (pid_t pid, ProcessType *process);
+ 
++void job_process_kill_timer      (Job *job, NihTimer *timer);
++
+ NIH_END_EXTERN
+ 
+ #endif /* INIT_JOB_PROCESS_H */
+
+=== added file 'init/load_state.c'
+--- init/load_state.c	1970-01-01 00:00:00 +0000
++++ init/load_state.c	2010-06-08 13:33:50 +0000
+@@ -0,0 +1,1801 @@
++/* upstart
++ *
++ * load_state.c - load saved init state
++ *
++ * Copyright © 2010
++ * Author: Jacek Konieczny <jajcus@jajcus.net>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2, as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++ */
++
++#ifdef HAVE_CONFIG_H
++# include <config.h>
++#endif				/* HAVE_CONFIG_H */
++
++#include <stdio.h>
++#include <errno.h>
++#include <string.h>
++#include <unistd.h>
++#include <time.h>
++#include <limits.h>
++
++#include <nih/main.h>
++#include <nih/macros.h>
++#include <nih/string.h>
++#include <nih/list.h>
++#include <nih/hash.h>
++#include <nih/logging.h>
++#include <nih/error.h>
++#include <nih/alloc.h>
++
++#include "environ.h"
++#include "process.h"
++#include "job_class.h"
++#include "job.h"
++#include "job_process.h"
++#include "event_operator.h"
++#include "blocked.h"
++#include "conf.h"
++#include "control.h"
++#include "load_state.h"
++#include "errors.h"
++#include "paths.h"
++
++/*
++ * GET_*FIELD macros: get a field value from the tree, not copying it
++ */
++
++/**
++ * GET_FIELD:
++ * @target: target variable,
++ * @object: ParsedStateValue object to retrieve the value from,
++ * @valtype: ParsedStateValueType type of the value to get,
++ * @member: name of the member of the ParsedStateValueType struct,
++ * @field: name of the field of @object to retrieve.
++ *
++ * Get a field from parsed state JSON object and store it in the @target
++ * variable. Used internally by other GET_* macros.
++ *
++ * When no such value is found or the value is null LOAD_VALUE_MISSING
++ * error is raised and 'goto error' is executed.
++ *
++ * If the value type does not match the requested @valtype LOAD_TYPE_MISMATCH
++ * error is raised and 'goto error' is executed.
++ */
++#define GET_FIELD(target, object, valtype, member, field) \
++		do { \
++			ParsedStateValue * _gf_value; \
++			_gf_value  = (ParsedStateValue *) \
++				nih_hash_lookup((object)->hash, (field)); \
++			if ( !_gf_value || _gf_value->type == VAL_NULL) { \
++				nih_error_raise_printf (LOAD_VALUE_MISSING, \
++				       "%s: '%s'", LOAD_VALUE_MISSING_STR, \
++				       field); \
++				goto error; \
++			} else if (_gf_value->type != (valtype)) { \
++				nih_error_raise_printf (LOAD_TYPE_MISMATCH, \
++				       "%s: '%s'", LOAD_TYPE_MISMATCH_STR, \
++				       field); \
++				goto error; \
++			} \
++			(target) = _gf_value->member; \
++		} while(0)
++
++/**
++ * GET_FIELD:
++ * @target: target variable,
++ * @object: ParsedStateValue object to retrieve the value from,
++ * @valtype: ParsedStateValueType type of the value to get,
++ * @member: name of the member of the ParsedStateValueType struct,
++ * @field: name of the field of @object to retrieve.
++ *
++ * Get an optional field from parsed state JSON object and store it in the
++ * @target variable.  Used internally by other GET_OPT_* macros.
++ *
++ * When the @field requested is not found in @object or the value is 'null'
++ * @target is not modifed.
++ *
++ * Then value type does not match the requested type a LOAD_TYPE_MISMATCH error
++ * is raised and 'goto error' is executed.
++ */
++#define GET_OPT_FIELD(target, object, valtype, member, field) \
++		do { \
++			ParsedStateValue * _gf_value; \
++			_gf_value  = (ParsedStateValue *) \
++				nih_hash_lookup((object)->hash, (field)); \
++			if ( !_gf_value || _gf_value->type == VAL_NULL) break;\
++			else if (_gf_value->type != (valtype)) { \
++				nih_error_raise_printf (LOAD_TYPE_MISMATCH, \
++				       "%s: '%s'", LOAD_TYPE_MISMATCH_STR, \
++				       field); \
++			       	goto error; \
++			} else (target) = _gf_value->member; \
++		} while(0)
++
++/**
++ * GET_OBJ_FIELD:
++ * @target: target variable (const ParsedValueState *),
++ * @object: ParsedStateValue object to retrieve the value from,
++ * @field: name of the field of @object to retrieve.
++ *
++ * Get a 'JSON object' field from other parsed state 'JSON object'
++ * and store it in the @target variable.
++ *
++ * When no such value is found or the value is null LOAD_VALUE_MISSING
++ * error is raised and 'goto error' is executed.
++ *
++ * If the value type is not a 'JSON object' LOAD_TYPE_MISMATCH error is raised
++ * and 'goto error' is executed.
++ */
++#define GET_OBJ_FIELD(target, object, field) \
++		do { \
++			(target) = (ParsedStateValue *) \
++				nih_hash_lookup((object)->hash, (field)); \
++			if ( !(target) || (target)->type == VAL_NULL) { \
++				nih_error_raise_printf (LOAD_VALUE_MISSING, \
++				       "%s: '%s'", LOAD_VALUE_MISSING_STR, \
++				       field); \
++				goto error; \
++			} else if ((target)->type != VAL_HASH) { \
++				nih_error_raise_printf (LOAD_TYPE_MISMATCH, \
++				       "%s: '%s'", LOAD_TYPE_MISMATCH_STR, \
++				       field); \
++				goto error; \
++			} \
++		} while(0)
++
++/**
++ * GET_OPT_OBJ_FIELD:
++ * @target: target variable (const ParsedValueState *),
++ * @object: ParsedStateValue object to retrieve the value from,
++ * @field: name of the field of @object to retrieve.
++ *
++ * Get a 'JSON object' field from other parsed state 'JSON object'
++ * and store it in the @target variable.
++ *
++ * When no such value is found or the value is null @target variable
++ * is not modified.
++ *
++ * If the value type is not a 'JSON object' LOAD_TYPE_MISMATCH error is raised
++ * and 'goto error' is executed.
++ */
++#define GET_OPT_OBJ_FIELD(target, object, field) \
++		do { \
++			ParsedStateValue * _value; \
++			_value = (ParsedStateValue *) \
++				nih_hash_lookup((object)->hash, (field)); \
++			if ( !_value || _value->type == VAL_NULL ) break; \
++			else if ( _value->type != VAL_HASH) { \
++				nih_error_raise_printf (LOAD_TYPE_MISMATCH, \
++				       "%s: '%s'", LOAD_TYPE_MISMATCH_STR, \
++				       field); \
++				goto error; \
++			} \
++			(target) = _value; \
++		} while(0)
++
++/**
++ * GET_INT_FIELD:
++ * @target: target variable (int),
++ * @object: ParsedStateValue object to retrieve the value from,
++ * @field: name of the field of @object to retrieve.
++ *
++ * Get an integer field value from a parsed state 'JSON object' and store it in
++ * the @target variable.
++ *
++ * When no such value is found or the value is null LOAD_VALUE_MISSING
++ * error is raised and 'goto error' is executed.
++ *
++ * If the value type is not integer LOAD_TYPE_MISMATCH error is raised and
++ * 'goto error' is executed.
++ */
++#define GET_INT_FIELD(target, object, field) \
++		GET_FIELD(target, object, VAL_INTEGER, integer, field)
++
++/**
++ * GET_OPT_INT_FIELD:
++ * @target: target variable (int),
++ * @object: ParsedStateValue object to retrieve the value from,
++ * @field: name of the field of @object to retrieve.
++ *
++ * Get an optional integer field value from a parsed state 'JSON object' and
++ * store it in the @target variable.
++ *
++ * When no such value is found or the value is null the @target variable 
++ * is not modified.
++ *
++ * If the value type is not integer LOAD_TYPE_MISMATCH error is raised and
++ * 'goto error' is executed.
++ */
++#define GET_OPT_INT_FIELD(target, object, field) \
++		GET_OPT_FIELD(target, object, VAL_INTEGER, integer, field)
++
++/**
++ * GET_STR_FIELD:
++ * @target: target variable (const char *),
++ * @object: ParsedStateValue object to retrieve the value from,
++ * @field: name of the field of @object to retrieve.
++ *
++ * Get a string field value from a parsed state 'JSON object' and store it in
++ * the @target variable. The value stored in the @target variable is allocated
++ * as a part of the parsed tree and will be invalid when the parsed state is
++ * freed.
++ *
++ * When no such value is found or the value is null LOAD_VALUE_MISSING
++ * error is raised and 'goto error' is executed.
++ *
++ * If the value type is not string LOAD_TYPE_MISMATCH error is raised and
++ * 'goto error' is executed.
++ */
++#define GET_STR_FIELD(target, object, field) \
++		GET_FIELD(target, object, VAL_STRING, string, field)
++
++/**
++ * GET_OPT_STR_FIELD:
++ * @target: target variable (const char *),
++ * @object: ParsedStateValue object to retrieve the value from,
++ * @field: name of the field of @object to retrieve.
++ *
++ * Get an optional string field value from a parsed state 'JSON object' and
++ * store it in the @target variable. The value stored in the @target variable
++ * is allocated as a part of the parsed tree and will be invalid when the
++ * parsed state is freed.
++ *
++ * When no such value is found or the value is null the @target variable 
++ * is not modified.
++ *
++ * If the value type is not string LOAD_TYPE_MISMATCH error is raised and
++ * 'goto error' is executed.
++ */
++#define GET_OPT_STR_FIELD(target, object, field) \
++		GET_OPT_FIELD(target, object, VAL_STRING, string, field)
++
++/**
++ * GET_LIST_FIELD:
++ * @target: target variable (NihList *),
++ * @object: ParsedStateValue object to retrieve the value from,
++ * @field: name of the field of @object to retrieve.
++ *
++ * Get the value of a 'JSON list' field from a parsed state 'JSON object' and
++ * store it in the @target variable.
++ *
++ * When no such value is found or the value is null LOAD_VALUE_MISSING
++ * error is raised and 'goto error' is executed.
++ *
++ * If the value type is not a 'JSON list' LOAD_TYPE_MISMATCH error is raised
++ * and 'goto error' is executed.
++ */
++#define GET_LIST_FIELD(target, object, field) \
++		GET_FIELD(target, object, VAL_LIST, list, field)
++
++/**
++ * GET_OPT_LIST_FIELD:
++ * @target: target variable (NihList *),
++ * @object: ParsedStateValue object to retrieve the value from,
++ * @field: name of the field of @object to retrieve.
++ *
++ * Get the value of an optional 'JSON list' field from a parsed state 'JSON
++ * object' and store it in the @target variable.
++ *
++ * When no such value is found or the value is null @target variable is not
++ * modified.
++ *
++ * If the value type is not a 'JSON list' LOAD_TYPE_MISMATCH error is raised
++ * and 'goto error' is executed.
++ */
++#define GET_OPT_LIST_FIELD(target, object, field) \
++		GET_OPT_FIELD(target, object, VAL_LIST, list, field)
++
++/**
++ * GET_HASH_FIELD:
++ * @target: target variable (NihHash *),
++ * @object: ParsedStateValue object to retrieve the value from,
++ * @field: name of the field of @object to retrieve.
++ *
++ * Get the value of an optional 'JSON object' field from a parsed state 'JSON
++ * object' and store it in the @target variable.
++ *
++ * When no such value is found or the value is null LOAD_VALUE_MISSING
++ * error is raised and 'goto error' is executed.
++ *
++ * If the value type is not a 'JSON object' LOAD_TYPE_MISMATCH error is raised
++ * and 'goto error' is executed.
++ */
++#define GET_HASH_FIELD(target, object, field) \
++		GET_FIELD(target, object, VAL_HASH, hash, field)
++/**
++ * GET_OPT_FIELD:
++ * @target: target variable (NihHash *),
++ * @object: ParsedStateValue object to retrieve the value from,
++ * @field: name of the field of @object to retrieve.
++ *
++ * Get the value of an optional 'JSON object' field from a parsed state 'JSON
++ * object' and store it in the @target variable.
++ *
++ * When no such value is found or the value is null @target variable is not
++ * modified.
++ *
++ * If the value type is not a 'JSON object' LOAD_TYPE_MISMATCH error is raised
++ * and 'goto error' is executed.
++ */
++#define GET_OPT_HASH_FIELD(target, object, field) \
++		GET_OPT_FIELD(target, object, VAL_HASH, hash, field)
++
++/*
++ * LOAD_*FIELD macros: copy a field value from the parsed tree
++ */
++
++
++/**
++ * LOAD_INT_FIELD:
++ * @target: target variable (int),
++ * @object: ParsedStateValue object to retrieve the value from,
++ * @field: name of the field of @object to retrieve.
++ *
++ * Get an integer field value from a parsed state 'JSON object' and store it in
++ * the @target variable.
++ *
++ * When no such value is found or the value is null LOAD_VALUE_MISSING
++ * error is raised and 'goto error' is executed.
++ *
++ * If the value type is not integer LOAD_TYPE_MISMATCH error is raised and
++ * 'goto error' is executed.
++ */
++#define LOAD_INT_FIELD(target, object, field) \
++		GET_INT_FIELD(target, object, field)
++
++/**
++ * LOAD_OPT_INT_FIELD:
++ * @target: target variable (int),
++ * @object: ParsedStateValue object to retrieve the value from,
++ * @field: name of the field of @object to retrieve.
++ *
++ * Get an optional integer field value from a parsed state 'JSON object' and
++ * store it in the @target variable.
++ *
++ * When no such value is found or the value is null the @target variable 
++ * is not modified.
++ *
++ * If the value type is not integer LOAD_TYPE_MISMATCH error is raised and
++ * 'goto error' is executed.
++ */
++#define LOAD_OPT_INT_FIELD(target, object, field) \
++		GET_OPT_INT_FIELD(target, object, field)
++
++/**
++ * LOAD_STR_FIELD:
++ * @target: target variable (char *),
++ * @parent: parent for the allocated string value,
++ * @object: ParsedStateValue object to retrieve the value from,
++ * @field: name of the field of @object to retrieve.
++ *
++ * Get a string field value from a parsed state 'JSON object' and store 
++ * a copy of it in the @target variable. 
++ *
++ * When no such value is found or the value is null LOAD_VALUE_MISSING
++ * error is raised and 'goto error' is executed.
++ *
++ * If the value type is not string LOAD_TYPE_MISMATCH error is raised and
++ * 'goto error' is executed.
++ *
++ * When string allocation fails a 'no memory' error is raised and 'goto error'
++ * is executed.
++ */
++#define LOAD_STR_FIELD(target, parent, object, field) \
++		do { \
++			const char *_lsf_value; \
++			GET_STR_FIELD(_lsf_value, object, field); \
++			(target) = nih_strdup(parent, _lsf_value); \
++			if ( (target) == NULL ) { \
++				nih_error_raise_no_memory (); \
++				goto error; \
++			} \
++		} while(0)
++
++/**
++ * LOAD_OPT_STR_FIELD:
++ * @target: target variable (char *),
++ * @parent: parent for the allocated string value,
++ * @object: ParsedStateValue object to retrieve the value from,
++ * @field: name of the field of @object to retrieve.
++ *
++ * Get a string field value from a parsed state 'JSON object' and store 
++ * a copy of it in the @target variable. 
++ *
++ * When no such value is found or the value is null @target variable is not
++ * modified.
++ *
++ * If the value type is not string LOAD_TYPE_MISMATCH error is raised and
++ * 'goto error' is executed.
++ *
++ * When string allocation fails a 'no memory' error is raised and 'goto error'
++ * is executed.
++ */
++#define LOAD_OPT_STR_FIELD(target, parent, object, field) \
++		do { \
++			const char *_lsf_value = NULL; \
++			GET_OPT_STR_FIELD(_lsf_value, object, field); \
++			if (_lsf_value) { \
++				(target) = nih_strdup(parent, _lsf_value); \
++				if ( (target) == NULL ) { \
++					nih_error_raise_no_memory (); \
++					goto error; \
++				} \
++			} \
++		} while(0)
++
++/**
++* LOAD_STRV_FIELD:
++* @target: target variable (char **),
++* @parent: parent for the allocated string value,
++* @object: ParsedStateValue object to retrieve the value from,
++* @field: name of the field of @object to retrieve.
++*
++* Get a string array field value from a parsed state 'JSON object' and store a
++* copy of it in the @target variable. If @target is not NULL, data will be
++* appended to existing array.
++*
++* When no such value is found or the value is null LOAD_VALUE_MISSING
++* error is raised and 'goto error' is executed.
++*
++* If the value type is not a list of strings LOAD_TYPE_MISMATCH error is raised
++* and 'goto error' is executed.
++*
++* When memory allocation fails a 'no memory' error is raised and 'goto error'
++* is executed.
++*/
++#define LOAD_STRV_FIELD(target, parent, object, field) \
++		do { \
++			NihList *_list; \
++			GET_LIST_FIELD(_list, object, field); \
++			if (load_strv(&(target), parent, _list)) goto error; \
++		} while(0)
++
++/**
++* LOAD_OPT_STRV_FIELD:
++* @target: target variable (char **),
++* @parent: parent for the allocated string array value,
++* @object: ParsedStateValue object to retrieve the value from,
++* @field: name of the field of @object to retrieve.
++*
++* Get an optional string array field value from a parsed state 'JSON object'
++* and store a copy of it in the @target variable. If @target is not NULL, data
++* will be appended to existing array.
++*
++* When no such value is found or the value is null @target is not modified.
++*
++* If the value type is not a list of strings LOAD_TYPE_MISMATCH error is raised
++* and 'goto error' is executed.
++*
++* When memory allocation fails a 'no memory' error is raised and 'goto error'
++* is executed.
++*/
++#define LOAD_OPT_STRV_FIELD(target, parent, object, field) \
++		do { \
++			NihList *_list = NULL; \
++			GET_OPT_LIST_FIELD(_list, object, field); \
++			if (_list == NULL) continue; \
++			if (load_strv(&(target), parent, _list)) goto error; \
++		} while(0)
++
++/**
++* LOAD_ENUM_FIELD:
++* @target: target variable (int or enum),
++* @mapping: value lookup table,
++* @object: ParsedStateValue object to retrieve the value from,
++* @field: name of the field of @object to retrieve.
++*
++* Get an enum value from a parsed state 'JSON object'.
++*
++* When no such value is found or the value is null LOAD_VALUE_MISSING
++* error is raised and 'goto error' is executed.
++*
++* If the value type is not a string LOAD_TYPE_MISMATCH error is raised and
++* 'goto error' is executed.
++*
++* When the value is not recognized LOAD_UNRECOGNIZED_VALUE error is raised
++* and 'goto error' is executed.
++*/
++#define LOAD_ENUM_FIELD(target, mapping, object, field) \
++		do { \
++			const char *_name; \
++			int _i; \
++			GET_STR_FIELD(_name, object, field); \
++			for(_i = 0; (mapping)[_i].name ; _i++) { \
++				if (!strcmp(_name, (mapping)[_i].name)) { \
++					break; \
++				} \
++			} \
++			if (!(mapping)[_i].name) { \
++				nih_error_raise_printf (LOAD_UNRECOGNIZED_VALUE, \
++				       "%s: '%s': '%s'", LOAD_UNRECOGNIZED_VALUE_STR, \
++				       field, _name); \
++				goto error; \
++			} \
++			(target) = (mapping)[_i].value; \
++		} while(0)
++
++/**
++* LOAD_OPT_ENUM_FIELD:
++* @target: target variable (int or enum),
++* @mapping: value lookup table,
++* @object: ParsedStateValue object to retrieve the value from,
++* @field: name of the field of @object to retrieve.
++*
++* Get an enum value from a parsed state 'JSON object'.
++*
++* When no such value is found or the value is null or unrecognized value
++* has been found, @target variable is not modified.
++*
++* If the value type is not a string LOAD_TYPE_MISMATCH error is raised and
++* 'goto error' is executed.
++*/
++#define LOAD_OPT_ENUM_FIELD(target, mapping, object, field) \
++		do { \
++			const char *_name = NULL; \
++			int _i; \
++			GET_OPT_STR_FIELD(_name, object, field); \
++			if (!_name) break; \
++			for(_i = 0; (mapping)[_i].name ; _i++) { \
++				if (!strcmp(_name, (mapping)[_i].name)) { \
++					break; \
++				} \
++			} \
++			if ((mapping)[_i].name) (target) = (mapping)[_i].value; \
++		} while(0)
++
++static int load_conf_source(ParsedStateValue *object) 
++	__attribute__ ((warn_unused_result));
++static int load_conf_file(ConfSource *source, ParsedStateValue *object) 
++	__attribute__ ((warn_unused_result));
++static int load_job_class(ParsedStateValue *object)
++	__attribute__ ((warn_unused_result));
++static int load_job(ParsedStateValue *object, JobClass *job_class) 
++	__attribute__ ((warn_unused_result));
++static int load_rlimit(struct rlimit **target, void *parent, ParsedStateValue *object) 
++	__attribute__ ((warn_unused_result));
++static int load_process(Process **target, void *parent, ParsedStateValue *object) 
++	__attribute__ ((warn_unused_result));
++static int load_event(ParsedStateValue *value)
++	__attribute__ ((warn_unused_result));
++static int load_nih_timer(NihTimer **target, void *parent,
++	            ParsedStateValue *object,
++		    NihTimerCb callback, void * data) 
++	__attribute__ ((warn_unused_result));
++static int load_nih_timer_schedule(NihTimerSchedule *target,
++	                	   ParsedStateValue *object) 
++	__attribute__ ((warn_unused_result));
++static int load_strv(char ***target, const void * parent,
++		     NihList *list)
++	__attribute__ ((warn_unused_result));
++static int load_event_operator_tree(EventOperator **target, void *parent,
++	            		    ParsedStateValue *object) 
++	__attribute__ ((warn_unused_result));
++static int load_event_operator_node(EventOperator **target, void *parent,
++				    ParsedStateValue *object) 
++	__attribute__ ((warn_unused_result));
++static int store_blocked(NihList *target, void *parent, ParsedStateValue *object)
++	__attribute__ ((warn_unused_result));
++static int load_blocked(NihList *target, void *parent, ParsedStateValue *object)
++	__attribute__ ((warn_unused_result));
++static int resolve_blocked()
++	__attribute__ ((warn_unused_result));
++
++#if 0
++static int is_field_defined(ParsedStateValue *object, const char *field);
++static int is_field_null(ParsedStateValue *object, const char *field);
++static int is_field_not_null(ParsedStateValue *object, const char *field);
++#endif
++
++typedef struct enum_mapping {
++	const char * name;
++	int value;
++} EnumMapping;
++
++/*
++ * These should not be exactly in sync with save_state.c,
++ * as it may handle different set of values saved by older 
++ * Upstart versions.
++ */
++static const EnumMapping expect_types_m[] = {
++	{ "none",	EXPECT_NONE },
++	{ "stop",	EXPECT_STOP },
++	{ "daemon",	EXPECT_DAEMON },
++	{ "fork",	EXPECT_FORK },
++	{ NULL, 0 }
++};
++static const EnumMapping blocked_types_m[] = {
++	{ "job",	BLOCKED_JOB},
++	{ "event",	BLOCKED_EVENT},
++	{ "emit_method",	BLOCKED_EMIT_METHOD},
++	{ "job_start_method",	BLOCKED_JOB_START_METHOD},
++	{ "job_stop_method",	BLOCKED_JOB_STOP_METHOD},
++	{ "job_restart_method",	BLOCKED_JOB_RESTART_METHOD},
++	{ "instance_start_method",	BLOCKED_INSTANCE_START_METHOD},
++	{ "instance_stop_method",	BLOCKED_INSTANCE_STOP_METHOD},
++	{ "instance_restart_method",	BLOCKED_INSTANCE_RESTART_METHOD},
++	{ NULL, 0 }
++};
++static const EnumMapping event_progress_m[] = {
++	{ "pending",	EVENT_PENDING },
++	{ "handling",	EVENT_HANDLING },
++	{ "finished",	EVENT_FINISHED },
++	{ NULL, 0 }
++};
++static const EnumMapping event_operator_types_m[] = {
++	{ "or",		EVENT_OR },
++	{ "and",	EVENT_AND },
++	{ "match",	EVENT_MATCH },
++	{ NULL, 0 }
++};
++static const EnumMapping job_goals_m[] = {
++	{ "stop",	JOB_STOP },
++	{ "start",	JOB_START },
++	{ "respawn",	JOB_RESPAWN },
++	{ NULL, 0 }
++};
++static const EnumMapping job_states_m[] = {
++	{ "waiting",	JOB_WAITING},
++	{ "starting",	JOB_STARTING},
++	{ "pre-start",	JOB_PRE_START},
++	{ "spawned",	JOB_SPAWNED},
++	{ "post-start",	JOB_POST_START},
++	{ "running",	JOB_RUNNING},
++	{ "pre-stop",	JOB_PRE_STOP},
++	{ "stopping",	JOB_STOPPING},
++	{ "killed",	JOB_KILLED},
++	{ "post-stop",	JOB_POST_STOP},
++	{ NULL, 0 }
++};
++static const EnumMapping trace_states_m[] = {
++	{ "none",	TRACE_NONE },
++	{ "new",	TRACE_NEW },
++	{ "new-child",	TRACE_NEW_CHILD },
++	{ "normal",	TRACE_NORMAL },
++	{ NULL, 0 }
++};
++static const EnumMapping console_types_m[] = {
++	{ "none",	CONSOLE_NONE },
++	{ "output",	CONSOLE_OUTPUT },
++	{ "owner",	CONSOLE_OWNER },
++	{ NULL, 0 }
++};
++static const EnumMapping process_types_m[] = {
++	{ "-1",		-1},
++	{ "main",	PROCESS_MAIN},
++	{ "pre-start",	PROCESS_PRE_START},
++	{ "post-start",	PROCESS_POST_START},
++	{ "pre-stop",	PROCESS_PRE_STOP},
++	{ "post-stop",	PROCESS_POST_STOP},
++	{ "last",	PROCESS_LAST},
++	{ NULL, 0 }
++};
++static const EnumMapping nih_timer_types_m[] = {
++	{ "timeout",	NIH_TIMER_TIMEOUT},
++	{ "periodic",	NIH_TIMER_PERIODIC},
++	{ "scheduled",	NIH_TIMER_SCHEDULED},
++	{ NULL, 0 }
++};
++static const EnumMapping conf_source_types_m[] = {
++	{ "file",	CONF_FILE},
++	{ "dir",	CONF_DIR},
++	{ "job-dir",	CONF_JOB_DIR},
++	{ NULL, 0 }
++};
++
++
++/**
++ * KnownJob:
++ * @entry: list header,
++ * @id: id of the job in the loaded state,
++ * @job: pointer to the loaded job.
++ *
++ * Used to keep track of jobs loaded from the saved state.
++ */
++typedef struct known_job {
++	NihList entry;
++	const char * id;
++	Job *job;
++} KnownJob;
++static NihHash * known_jobs = NULL;
++
++/**
++ * KnownEvent:
++ * @entry: list header,
++ * @id: id of the event in the loaded state,
++ * @job: pointer to the loaded event.
++ *
++ * Used to keep track of events loaded from the saved state.
++ */
++typedef struct known_event {
++	NihList entry;
++	const char * id;
++	Event *event;
++	int blockers;
++} KnownEvent;
++static NihHash * known_events = NULL;
++
++/**
++ * UnresolvedBlocked:
++ * @entry: list header,
++ * @object: saved state object describing the Blocked object,
++ * @target: list where the Blocked object should be loaded.
++ *
++ * Used to postpone Blocked objects loading until all the events
++ * and jobs are loaded so the references can be resolved.
++ */
++typedef struct unresolved_blocked {
++	NihList entry;
++	ParsedStateValue * object;
++	NihList * target;
++	void * parent;
++} UnresolvedBlocked;
++static NihList *unresolved_blocked = NULL;
++
++/**
++ * LoadedJobConfFiles:
++ * @entry: list header,
++ * @job_class_id: id of job class loaded from this file,
++ * @file: ConfFile object.
++ *
++ * Used to assing loaded jobs to the ConfFile objects loaded earlier
++ */
++typedef struct loaded_job_conf_file {
++	NihList entry;
++	const char * job_class_id;
++	ConfFile *file;
++} LoadedJobConfFile;
++static NihHash * loaded_job_conf_files = NULL;
++	
++/**
++ * unknown_source:
++ *
++ * A 'virtual' source configuration used for jobs for which
++ * no other source can be recognized. This happens when
++ * original source has been deleted (or treated as deleted by Upstart)
++ * after the job class has been loaded.
++ */
++static ConfSource *unknown_source = NULL;
++
++/**
++ * load_state_init:
++ *
++ * Initialize the state loader global objects.
++ */
++void
++load_state_init()
++{
++	if (!unknown_source)
++		unknown_source = NIH_MUST ( conf_source_new(NULL, 
++					                    "<unknown>",
++							    CONF_JOB_DIR) );
++}
++
++/**
++ * load_state:
++ *
++ * Load saved init state from STATE_DUMP_FILE
++ *
++ * Returns: 0 on success, negative value on raised error.
++ */
++int 
++load_state() {
++	int rc;
++	FILE *f;
++       
++	nih_info(_("Loading state from '%s'"), STATE_DUMP_FILE);
++	f = fopen(STATE_DUMP_FILE, "r");
++	if (f == NULL) {
++		nih_error_raise_system ();
++		return -1;
++	}
++	rc = load_state_from(f);
++	fclose(f);
++	return rc;
++}
++
++/**
++ * load_state_from:
++ * @stream: stdio stream to load the saved state from.
++ *
++ * Load saved init state from @stream.
++ *
++ * Returns: 0 on success, negative value on raised error.
++ */
++int 
++load_state_from(FILE *stream) {
++
++	ParsedStateValue *state, *meta;
++	const char *format_version;
++	NihList *parsed_events;
++	NihHash *parsed_job_classes;
++	NihList *sources;
++
++	load_state_init();
++
++	state = parse_state(stream);
++	if (state == NULL) return -1;
++
++	nih_assert(known_jobs == NULL);
++	nih_assert(known_events == NULL);
++	nih_assert(unresolved_blocked == NULL);
++	nih_assert(loaded_job_conf_files == NULL);
++
++	known_jobs = nih_hash_string_new (NULL, 0);
++	if (known_jobs == NULL) {
++		nih_error_raise_no_memory ();
++		goto error;
++	}
++	known_events = nih_hash_string_new (NULL, 0);
++	if (known_events == NULL) {
++		nih_error_raise_no_memory ();
++		goto error;
++	}
++	loaded_job_conf_files = nih_hash_string_new (NULL, 0);
++	if (loaded_job_conf_files == NULL) {
++		nih_error_raise_no_memory ();
++		goto error;
++	}
++	unresolved_blocked = nih_list_new(NULL);
++	if (unresolved_blocked == NULL) {
++		nih_error_raise_no_memory ();
++		goto error;
++	}
++
++	GET_OBJ_FIELD(meta, state, "meta");
++	GET_STR_FIELD(format_version, meta, "format_version");
++	if (strcmp(format_version, "0.0")) {
++		nih_error_raise_printf (LOAD_BAD_FORMAT_VERSION,
++		       "%s: '%s'", LOAD_BAD_FORMAT_VERSION_STR,
++		       format_version);
++		goto error;
++	}
++	GET_LIST_FIELD(sources, state, "conf_sources");
++	NIH_LIST_FOREACH(sources, iter) {
++		if (load_conf_source((ParsedStateValue *)iter)) goto error;
++	}
++
++	GET_LIST_FIELD(parsed_events, state, "events");
++	NIH_LIST_FOREACH(parsed_events, iter) {
++		if (load_event((ParsedStateValue *)iter)) {
++			NihError *error = nih_error_get();
++			if (error->number == LOAD_VALUE_MISSING) {
++				nih_warn("Skipping invalid saved event: %s",
++				 	 error->message);
++				nih_free(error);
++			}
++			else goto error;
++		}
++	}
++	GET_HASH_FIELD(parsed_job_classes, state, "job_classes");
++	NIH_HASH_FOREACH(parsed_job_classes, iter) {
++		if (load_job_class((ParsedStateValue *)iter)) {
++			NihError *error = nih_error_get();
++			if (error->number == LOAD_VALUE_MISSING) {
++				nih_warn("Skipping invalid saved job_class: %s",
++				 	 error->message);
++				nih_free(error);
++			}
++			else goto error;
++		}
++	}
++	if (resolve_blocked()) {
++		NihError *error = nih_error_get();
++		if (error->number == ENOMEM) goto error;
++		nih_warn("Some blocking objects not resolved: %s",
++			       				error->message);
++		nih_free(error);
++	}
++
++	NIH_HASH_FOREACH(known_events, iter) {
++		KnownEvent *known_event = (KnownEvent *)iter;
++		if (known_event->blockers) {
++			nih_warn("Problem during state restore: %i blockers"
++					" not restored", known_event->blockers);
++		}
++		nih_debug("Loaded event %p (%s) has %i blockers", 
++			  known_event->event, known_event->event->name,
++			  known_event->event->blockers);
++	}
++	nih_free(state);
++	nih_free(known_jobs);
++	nih_free(known_events);
++	nih_free(unresolved_blocked);
++	nih_free(loaded_job_conf_files);
++	known_jobs = NULL;
++	known_events = NULL;
++	unresolved_blocked = NULL;
++	loaded_job_conf_files = NULL;
++	return 0;
++error:
++	nih_free(state);
++	if (loaded_job_conf_files) nih_free(loaded_job_conf_files);
++	if (unresolved_blocked) nih_free(unresolved_blocked);
++	if (known_jobs) nih_free(known_jobs);
++	if (known_events) nih_free(known_events);
++	known_jobs = NULL;
++	known_events = NULL;
++	unresolved_blocked = NULL;
++	loaded_job_conf_files = NULL;
++	return -1;
++}
++
++/**
++ * load_conf_source:
++ * @object: object holding the config source information.
++ *
++ * Load a ConfSource from the parsed state.
++ *
++ * Returns: 0 on success, negative value on raised error.
++ */
++static int 
++load_conf_source(ParsedStateValue *object) 
++{
++
++	ConfSource *source = NULL;
++	char *path;
++	ConfSourceType type;
++	int flag;
++	NihHash *files;
++
++	GET_STR_FIELD(path, object, "path");
++	LOAD_ENUM_FIELD(type, conf_source_types_m, object, "type");
++	LOAD_INT_FIELD(flag, object, "flag");
++
++	if (type != CONF_JOB_DIR) return 0;
++
++	source = conf_source_new(NULL, path, type);
++	if (source == NULL) {
++		nih_error_raise_no_memory ();
++		goto error;
++	}
++	source->flag = flag;
++
++	files = NULL;
++	GET_OPT_HASH_FIELD(files, object, "files");
++	if (files) {
++		NIH_HASH_FOREACH(files, iter) {
++			if (load_conf_file(source, (ParsedStateValue *)iter))
++			       goto error;
++		}
++	}
++	return 0;
++error:
++	return -1;
++}
++
++/**
++ * load_conf_file:
++ * @object: object holding the config file details.
++ *
++ * Load a ConfFile from the parsed state.
++ *
++ * Returns: 0 on success, negative value on raised error.
++ */
++static int 
++load_conf_file(ConfSource *source, ParsedStateValue *object) 
++{
++
++	ConfFile *file = NULL;
++	LoadedJobConfFile *loaded = NULL;
++	char *path;
++	int flag;
++
++	if (source->type == CONF_JOB_DIR) {
++		loaded = nih_new(loaded_job_conf_files, LoadedJobConfFile);
++		if (loaded == NULL) {
++			nih_error_raise_no_memory ();
++			goto error;
++		}
++		nih_list_init(&loaded->entry);
++	}
++
++	GET_STR_FIELD(path, object, "path");
++	LOAD_INT_FIELD(flag, object, "flag");
++
++	file = conf_file_new(source, path);
++	if (file == NULL) {
++		nih_error_raise_no_memory ();
++		goto error;
++	}
++	file->flag = flag;
++	LOAD_STR_FIELD(loaded->job_class_id, loaded, object, "job");
++	loaded->file = file;
++	nih_hash_add(loaded_job_conf_files, (NihList *)loaded);
++	return 0;
++error:
++	if (loaded) nih_discard(loaded);
++	if (file) nih_discard(file);
++	return -1;
++}
++
++/**
++ * load_event:
++ * @object: object holding the parsed event.
++ *
++ * Load an Event from the parsed state.
++ *
++ * Returns: 0 on success, negative value on raised error.
++ */
++static int 
++load_event(ParsedStateValue *object) 
++{
++
++	Event *event = NULL;
++	KnownEvent *known_event = NULL;
++	NihList *blocking;
++	const char * name;
++
++	GET_STR_FIELD(name, object, "name");
++
++	event = event_new(NULL, name, NULL);
++	if (event == NULL) {
++		nih_error_raise_no_memory ();
++		return -1;
++	}
++
++	LOAD_STRV_FIELD(event->env, event, object, "env");
++
++	known_event = nih_new(known_events, KnownEvent);
++	if (known_event == NULL) {
++		nih_error_raise_no_memory ();
++		nih_free(event);
++		return -1;
++	}
++	nih_list_init((NihList *)known_event);
++	LOAD_STR_FIELD(known_event->id, known_event, object, "id");
++	known_event->event = event;
++	nih_ref(event, known_event);
++
++	LOAD_OPT_ENUM_FIELD(event->progress, event_progress_m, object, "progress");
++	LOAD_OPT_INT_FIELD(event->failed, object, "failed");
++	/* actual event->blockers will be re-built when event operators are read */
++	LOAD_OPT_INT_FIELD(known_event->blockers, object, "blockers");
++	blocking = NULL;
++	GET_OPT_LIST_FIELD(blocking, object, "blocking");
++	if (blocking) {
++		NIH_LIST_FOREACH(blocking, iter) {
++			if (store_blocked(&event->blocking, event,
++					(ParsedStateValue *)iter)) goto error;
++		}
++	}
++	nih_hash_add(known_events, (NihList *)known_event);
++	return 0;
++error:
++	if (known_event) nih_free(known_event);
++	if (event) nih_discard(event);
++	return -1;
++}
++
++/**
++ * store_blocked:
++ * @target: target list for the Blocked object,
++ * @object: parsed state value object holding the Blocked object data.
++ *
++ * Store the parsed state of Blocked object for processing later, 
++ * when the references within can be resolved.
++ *
++ * Returns: 0 on success, negative value on raised error.
++ */
++static int
++store_blocked(NihList *target, void * parent, ParsedStateValue *object)
++{
++
++	UnresolvedBlocked *ublocked;
++
++	ublocked = nih_new(unresolved_blocked, UnresolvedBlocked);
++	if (ublocked == NULL) {
++		nih_error_raise_no_memory ();
++		return -1;
++	}
++	ublocked->object = object;
++	ublocked->target = target;
++	ublocked->parent = parent;
++	nih_list_init(&ublocked->entry);
++	nih_list_add(unresolved_blocked, (NihList *)ublocked);
++	return 0;
++}
++
++/**
++ * resolve_blocked:
++ *
++ * Load stored Blocked objects, resolving the Object and Events references
++ * inside.
++ *
++ * Returns: 0 on success, negative value on raised error.
++ */
++static int
++resolve_blocked()
++{
++	int rc = 0;
++
++	NIH_LIST_FOREACH(unresolved_blocked, iter) {
++		UnresolvedBlocked * ublocked = (UnresolvedBlocked *)iter;
++		if (load_blocked(ublocked->target, ublocked->parent, 
++				 ublocked->object)) rc = -1;
++	}
++	return rc;
++}
++
++/**
++ * load_blocked:
++ * @target: list where the loaded object should be added to,
++ * @object: saved state value object holding Blocked object data.
++ *
++ * Load stored Blocked object, resolving the Object and Events references
++ * inside. Add the loaded object to the @target list.
++ *
++ * Returns: 0 on success, negative value on raised error.
++ */
++static int
++load_blocked(NihList *target, void *parent, ParsedStateValue *object)
++{
++	Blocked *blocked;
++	BlockedType type;
++	const char *id;
++	void *data;
++	KnownJob *known_job;
++	KnownEvent *known_event;
++
++	LOAD_ENUM_FIELD(type, blocked_types_m, object, "type");
++	switch (type) {
++	case BLOCKED_JOB:
++		GET_STR_FIELD(id, object, "job");
++		known_job = (KnownJob *) nih_hash_lookup(known_jobs, id);
++		if (known_job == NULL) {
++			nih_error_raise_printf (LOAD_VALUE_MISSING,
++			       "%s: job='%s'", LOAD_VALUE_MISSING_STR, id);
++			goto error;
++		}
++		data = known_job->job;
++		nih_debug("loaded BLOCKED_JOB for %p: %p (%s/%s)", parent, data,
++			  known_job->job->class->name, known_job->job->name);
++		break;
++	case BLOCKED_EVENT:
++		GET_STR_FIELD(id, object, "event");
++		known_event = (KnownEvent *) nih_hash_lookup(known_events, id);
++		if (known_event == NULL) {
++			nih_error_raise_printf (LOAD_VALUE_MISSING,
++			       "%s: event='%s'", LOAD_VALUE_MISSING_STR, id);
++			goto error;
++		}
++		data = known_event->event;
++		nih_debug("loaded BLOCKED_EVENT for %p: %p (%s)", parent, data,
++			  known_event->event->name);
++		break;
++	case BLOCKED_EMIT_METHOD:
++	case BLOCKED_JOB_START_METHOD:
++	case BLOCKED_JOB_STOP_METHOD:
++	case BLOCKED_JOB_RESTART_METHOD:
++	case BLOCKED_INSTANCE_START_METHOD:
++	case BLOCKED_INSTANCE_STOP_METHOD:
++	case BLOCKED_INSTANCE_RESTART_METHOD:
++	default:
++		nih_debug("ignored BLOCKED_something(%i) for %p", type, parent);
++		// Not supported yet
++		return 0;
++	}
++	blocked = blocked_new(parent, type, data);
++	if (blocked == NULL) {
++		nih_error_raise_no_memory ();
++		goto error;
++	}
++	nih_list_add(target, (NihList *)blocked);
++	return 0;
++error:
++	if (blocked) nih_discard(blocked);
++	return -1;
++}
++
++/**
++ * load_job_class:
++ * @object: object holding the parsed job class,
++ * @virual_source: ConfSource object this class should be assigned to.
++ *
++ * Load a JobClass object (including related Jobs) from the parsed state.
++ *
++ * Returns: 0 on success, negative value on raised error.
++ */
++static int 
++load_job_class(ParsedStateValue *object) 
++{
++	const char *id;
++	JobClass *job_class;
++	NihHash *instances;
++	ParsedStateValue *operator;
++	NihList *list;
++	int count;
++	LoadedJobConfFile *conf;
++	ConfFile *conf_file;
++
++	GET_STR_FIELD(id, object, "id");
++	conf = (LoadedJobConfFile *) nih_hash_lookup(loaded_job_conf_files, id);
++	if (conf == NULL) {
++		conf_file = conf_file_new(unknown_source,
++			           	     "<unknown>/<unknown>");
++		if (conf_file == NULL) {
++			nih_error_raise_printf (LOAD_VALUE_MISSING,
++			       "%s: conf_file for job_class='%s'", LOAD_VALUE_MISSING_STR, id);
++			return -1;
++		}
++	}
++	else {
++		conf_file = conf->file;
++	}
++
++	job_class = job_class_new(NULL, object->key);
++	if (job_class == NULL) {
++		nih_error_raise_no_memory ();
++		return -1;
++	}
++	conf_file->job = job_class;
++
++	// job_class->name initialized by job_class_new
++	LOAD_STR_FIELD(job_class->path, job_class, object, "path");
++	LOAD_OPT_STR_FIELD(job_class->instance, job_class, object, "instance");
++	LOAD_OPT_STR_FIELD(job_class->description, job_class, object, "description");
++	LOAD_OPT_STR_FIELD(job_class->author, job_class, object, "author");
++	LOAD_OPT_STR_FIELD(job_class->version, job_class, object, "version");
++	LOAD_OPT_STRV_FIELD(job_class->env, job_class, object, "env");
++	LOAD_OPT_STRV_FIELD(job_class->export, job_class, object, "export");
++	operator = NULL;
++	GET_OPT_OBJ_FIELD(operator, object, "start_on");
++	if (operator && load_event_operator_tree(
++			&job_class->start_on, job_class, operator)) goto error;
++	operator = NULL;
++	GET_OPT_OBJ_FIELD(operator, object, "stop_on");
++	if (operator && load_event_operator_tree(
++			&job_class->stop_on, job_class, operator)) goto error;
++	LOAD_OPT_STRV_FIELD(job_class->emits, job_class, object, "emits");
++	list = NULL;
++	GET_OPT_LIST_FIELD(list, object, "process");
++	if (list) {
++		int i = 0;
++		NIH_LIST_FOREACH(list, iter) {
++			if (i == PROCESS_LAST) break;
++			ParsedStateValue *value = (ParsedStateValue *)iter;
++			if (value->type == VAL_NULL) {
++				job_class->process[i++] = NULL;
++				continue;
++			}
++			if (load_process(&job_class->process[i++],
++					 job_class, value)) goto error;
++		}
++	}
++	LOAD_OPT_ENUM_FIELD(job_class->expect, expect_types_m, object, "expect");
++	LOAD_OPT_INT_FIELD(job_class->task, object, "task");
++	LOAD_OPT_INT_FIELD(job_class->kill_timeout, object, "kill_timeout");
++	LOAD_OPT_INT_FIELD(job_class->respawn, object, "respawn");
++	LOAD_OPT_INT_FIELD(job_class->respawn_limit, object, "respawn_limit");
++	LOAD_OPT_INT_FIELD(job_class->respawn_interval, object, "respawn_interval");
++	list = NULL;
++	GET_OPT_LIST_FIELD(list, object, "normalexit");
++	if (list) {
++		count = 0;
++		NIH_LIST_FOREACH(list, iter) count++;
++		job_class->normalexit_len = count;
++		job_class->normalexit = (int *)nih_alloc(job_class,
++			             	                 count * sizeof(int));
++		if (job_class->normalexit == NULL) {
++			nih_error_raise_no_memory ();
++			goto error;
++		}
++		int i = 0;
++		NIH_LIST_FOREACH(list, iter) {
++			ParsedStateValue *value = (ParsedStateValue *)iter;
++			if (value->type != VAL_INTEGER) {
++				nih_error_raise_printf (LOAD_TYPE_MISMATCH,
++				       "%s: '%s'", LOAD_TYPE_MISMATCH_STR,
++				       "normalexit");
++				goto error;
++			}
++			job_class->normalexit[i++] = value->integer;
++		}
++	}
++	LOAD_OPT_ENUM_FIELD(job_class->console, console_types_m, object, "console");
++	LOAD_OPT_INT_FIELD(job_class->nice, object, "nice");
++	LOAD_OPT_INT_FIELD(job_class->oom_adj, object, "oom_adj");
++	list = NULL;
++	GET_OPT_LIST_FIELD(list, object, "limits");
++	if (list) {
++		int i = 0;
++		NIH_LIST_FOREACH(list, iter) {
++			ParsedStateValue *value = (ParsedStateValue *)iter;
++			if (i >= RLIMIT_NLIMITS) break;
++			if (value->type == VAL_NULL) {
++				i++;
++				continue;
++			}
++			if (value->type != VAL_HASH) {
++				nih_error_raise_printf (LOAD_TYPE_MISMATCH,
++				       "%s: '%s'", LOAD_TYPE_MISMATCH_STR,
++				       "limits");
++			       	goto error;
++			}
++			if (load_rlimit(&job_class->limits[i++],
++					job_class, value)) goto error;
++		}
++	}
++	LOAD_OPT_STR_FIELD(job_class->chroot, job_class, object, "chroot");
++	LOAD_OPT_STR_FIELD(job_class->chdir, job_class, object, "chdir");
++	LOAD_OPT_INT_FIELD(job_class->deleted, object, "deleted");
++
++	job_class_consider(job_class);
++
++	GET_HASH_FIELD(instances, object, "instances");
++	NIH_HASH_FOREACH(instances, iter) {
++		if (load_job((ParsedStateValue *)iter, job_class)) {
++			NihError *error = nih_error_get();
++			if (error->number == LOAD_VALUE_MISSING) {
++				nih_warn("Skipping invalid saved job_class: %s",
++				 	 error->message);
++				nih_free(error);
++			}
++			else goto error;
++		}
++	}
++	return 0;
++error:
++	nih_discard(job_class);
++	return -1;
++}
++
++/**
++ * load_rlimit:
++ * @target: pointer to the target variable,
++ * @parent: parent object for memory allocation,
++ * @object: object holding the parsed job class.
++ *
++ * Load a JobClass object (including related Jobs) from the parsed state.
++ *
++ * Returns: 0 on success, negative value on raised error.
++ */
++static int 
++load_rlimit(struct rlimit **target, void *parent, ParsedStateValue *object) 
++{
++	*target = nih_new(parent, struct rlimit);
++	if (*target == NULL) {
++		nih_error_raise_no_memory ();
++	       	goto error;
++	}
++	(*target)->rlim_cur = RLIM_INFINITY;
++	(*target)->rlim_max = RLIM_INFINITY;
++	LOAD_OPT_INT_FIELD((*target)->rlim_cur, object, "soft");
++	LOAD_OPT_INT_FIELD((*target)->rlim_max, object, "hard");
++	return 0;
++error:
++	return -1;
++}
++
++/**
++ * load_process:
++ * @target: target variable,
++ * @parent: parent object for memory allocation,
++ * @object: object holding the parsed Process.
++ *
++ * Load a Process object from the parsed state.
++ *
++ * Returns: 0 on success, negative value on raised error.
++ */
++static int 
++load_process(Process **target, void *parent, ParsedStateValue *object) 
++{
++	*target = process_new(parent);
++	if (*target == NULL) {
++		nih_error_raise_no_memory ();
++		goto error;
++	}
++	LOAD_INT_FIELD((*target)->script, object, "script");
++	LOAD_STR_FIELD((*target)->command, parent, object, "command");
++	return 0;
++error:
++	return -1;
++}
++
++/**
++ * load_job:
++ * @object: object holding the parsed job,
++ * @job_class: class for this job.
++ *
++ * Load a Job object from the parsed state.
++ *
++ * Returns: 0 on success, negative value on raised error.
++ */
++static int 
++load_job(ParsedStateValue *object, JobClass *job_class) 
++{
++
++	Job *job = NULL;
++	NihList * blocking;
++	const char *id;
++	KnownJob *known_job;
++	ParsedStateValue *operator;
++	ParsedStateValue *value;
++	NihList * list;
++
++	job = job_new(job_class, object->key);
++	if (job == NULL) {
++		nih_error_raise_no_memory ();
++		return -1;
++	}
++
++	known_job = nih_new(known_jobs, KnownJob);
++	if (known_job == NULL) {
++		nih_error_raise_no_memory ();
++		nih_free(job);
++		return -1;
++	}
++	nih_list_init((NihList *)known_job);
++	LOAD_STR_FIELD(known_job->id, known_job, object, "id");
++	known_job->job = job;
++
++	// job->name and job->class initialized by object->key
++	LOAD_STR_FIELD(job->path, job, object, "path");
++	LOAD_OPT_ENUM_FIELD(job->goal, job_goals_m, object, "goal");
++	LOAD_OPT_ENUM_FIELD(job->state, job_states_m, object, "state");
++	LOAD_OPT_STRV_FIELD(job->env, job, object, "env");
++	LOAD_OPT_STRV_FIELD(job->start_env, job, object, "start_env");
++	LOAD_OPT_STRV_FIELD(job->stop_env, job, object, "stop_env");
++	operator = NULL;
++	GET_OPT_OBJ_FIELD(operator, object, "stop_on");
++	if (operator && load_event_operator_tree(
++			&job->stop_on, job, operator)) goto error;
++	list = NULL;
++	GET_OPT_LIST_FIELD(list, object, "pid");
++	if (list) {
++		int i = 0;
++		NIH_LIST_FOREACH(list, iter) {
++			if (i == PROCESS_LAST) break;
++			ParsedStateValue *value = (ParsedStateValue *)iter;
++			if (value->type == VAL_NULL) {
++				i++;
++		       		continue;
++			}
++			if (value->type != VAL_INTEGER) {
++				nih_error_raise_printf (LOAD_TYPE_MISMATCH,
++				       "%s: '%s'", LOAD_TYPE_MISMATCH_STR,
++				       "pid");
++				goto error;
++			}
++			job->pid[i++] = value->integer;
++		}
++	}
++	// All events should be loaded by now, so the reference can be resolved
++	id = NULL;
++	GET_OPT_STR_FIELD(id, object, "blocker");
++	if (id) {
++		KnownEvent *known_event;
++		known_event = (KnownEvent *) nih_hash_lookup(known_events, id);
++		if (known_event == NULL) {
++			nih_warn("Blocker event '%s' missing for saved job '%s/%s'",
++				 id, job_class->name, job->name);
++		}
++		else {
++			job->blocker = known_event->event;
++		}
++	}
++	blocking = NULL;
++	GET_OPT_LIST_FIELD(blocking, object, "blocking");
++	if (blocking) {
++		NIH_LIST_FOREACH(blocking, iter) {
++			if (store_blocked(&job->blocking, job,
++					  (ParsedStateValue *)iter)) goto error;
++		}
++	}
++	value = NULL;
++	GET_OPT_OBJ_FIELD(value, object, "kill_timer");
++	if (value && load_nih_timer(&job->kill_timer, job, value,
++		    (NihTimerCb)job_process_kill_timer, job)) goto error;
++	LOAD_OPT_ENUM_FIELD(job->kill_process, process_types_m, object, "kill_process");
++	LOAD_OPT_INT_FIELD(job->failed, object, "failed");
++	LOAD_OPT_ENUM_FIELD(job->failed_process, process_types_m, object, "failed_process");
++	LOAD_OPT_INT_FIELD(job->exit_status, object, "exit_status");
++	LOAD_OPT_INT_FIELD(job->respawn_time, object, "respawn_time");
++	LOAD_OPT_INT_FIELD(job->respawn_count, object, "respawn_count");
++	LOAD_OPT_INT_FIELD(job->trace_forks, object, "trace_forks");
++	LOAD_OPT_ENUM_FIELD(job->trace_state, trace_states_m, object, "trace_state");
++	
++	nih_hash_add(known_jobs, (NihList *)known_job);
++	return 0;
++error:
++	if (job) nih_discard(job);
++	return -1;
++}
++
++/**
++ * load_nih_timer:
++ * @target: pointer to the target variable,
++ * @parent: parent object for memory allocation,
++ * @object: object holding the parsed timer,
++ * @callback: callback function for the timer,
++ * @data: data for the timer callback.
++ *
++ * Load a NihTimer object from the parsed state.
++ *
++ * Returns: 0 on success, negative value on raised error.
++ */
++static int 
++load_nih_timer(NihTimer **target, void *parent,
++	            ParsedStateValue *object,
++		    NihTimerCb callback, void * data) 
++{
++
++	NihTimerType type;
++	time_t due = 0;
++	time_t timeout = 0;
++	time_t period = 0;
++	NihTimerSchedule schedule;
++	ParsedStateValue *value;
++	struct timespec now;
++	NihTimer *timer;
++
++	if (clock_gettime(CLOCK_MONOTONIC, &now)) {
++		nih_error_raise_system ();
++		goto error;
++	}
++
++	LOAD_ENUM_FIELD(type, nih_timer_types_m, object, "type");
++	GET_OPT_INT_FIELD(due, object, "due");
++	GET_OPT_INT_FIELD(timeout, object, "timeout");
++	GET_OPT_INT_FIELD(period, object, "period");
++	value = NULL;
++	GET_OPT_OBJ_FIELD(value, object, "schedule");
++	if (value && load_nih_timer_schedule(&schedule, value)) goto error;
++
++	switch (type) {
++	case NIH_TIMER_TIMEOUT:
++		timer = nih_timer_add_timeout (parent, timeout, callback, data);
++		break;
++	case NIH_TIMER_PERIODIC:
++		timer = nih_timer_add_periodic (parent, period, callback, data);
++		break;
++	case NIH_TIMER_SCHEDULED:
++		timer = nih_timer_add_scheduled (parent, &schedule, callback, data);
++		break;
++	default:
++		nih_assert_not_reached();
++		break;
++	}
++	if (timer == NULL) {
++		nih_error_raise_no_memory ();
++		goto error;
++	}
++	if (due) timer->due = due;
++	*target = timer;
++	return 0;
++error:
++	return -1;
++}
++
++/**
++ * load_nih_timer_schedule:
++ * @target: pointer to the target variable,
++ * @object: object holding the parsed schedule.
++ *
++ * Load a NihTimerSchedule object from the parsed state.
++ *
++ * Returns: 0 on success, negative value on raised error.
++ */
++static int 
++load_nih_timer_schedule(NihTimerSchedule *target, ParsedStateValue *object) 
++{
++
++	LOAD_OPT_INT_FIELD(target->minutes, object, "minutes");
++	LOAD_OPT_INT_FIELD(target->hours, object, "hours");
++	LOAD_OPT_INT_FIELD(target->mdays, object, "mdays");
++	LOAD_OPT_INT_FIELD(target->months, object, "months");
++	LOAD_OPT_INT_FIELD(target->wdays, object, "wdays");
++	return 0;
++error:
++	return -1;
++}
++
++/**
++ * load_event_operator_tree:
++ * @target: pointer to the target variable,
++ * @parent: parent object for memory allocation,
++ * @object: object holding the parsed event operator tree node.
++ *
++ * Recursively load a EventOperator tree.
++ *
++ * Returns: 0 on success, negative value on raised error.
++ */
++static int 
++load_event_operator_tree(EventOperator **target, void *parent,
++	            ParsedStateValue *object) 
++{
++	EventOperator *operator;
++	ParsedStateValue *value, *left, *right;
++	
++	*target = NULL;
++	GET_OBJ_FIELD(value, object, "value");
++	if (load_event_operator_node(target, parent, value)) goto error;
++	left = NULL;
++	GET_OPT_OBJ_FIELD(left, object, "left");
++	if (left) {
++		if (load_event_operator_tree(&operator, *target, left)) {
++			goto error;
++		}
++		nih_tree_add((NihTree *)*target, (NihTree *)operator, NIH_TREE_LEFT);
++	}
++	right = NULL;
++	GET_OPT_OBJ_FIELD(right, object, "right");
++	if (right) {
++		if (load_event_operator_tree(&operator, *target, right)) {
++			goto error;
++		}
++		nih_tree_add((NihTree *)*target, (NihTree *)operator, NIH_TREE_RIGHT);
++	}
++	return 0;
++error:
++	if (*target) nih_discard(*target);
++	*target = NULL;
++	return -1;
++}
++
++/**
++ * load_event_operator_node:
++ * @target: pointer to the target variable,
++ * @parent: parent object for memory allocation,
++ * @object: object holding the parsed event operator value.
++ *
++ * Load values of an EventOperator object.
++ *
++ * Expects that all events that could be referenced by the EventOperator are
++ * already loaded.
++ *
++ * Returns: 0 on success, negative value on raised error.
++ */
++static int 
++load_event_operator_node(EventOperator **target, void *parent,
++	            ParsedStateValue *object) 
++{
++
++	EventOperatorType type;
++	int value;
++	char *name = NULL;
++	char **env = NULL;
++	KnownEvent *known_event = NULL;
++	const char *id;
++
++	LOAD_ENUM_FIELD(type, event_operator_types_m, object, "type");
++	LOAD_INT_FIELD(value, object, "value");
++	GET_OPT_STR_FIELD(name, object, "name");
++	LOAD_OPT_STRV_FIELD(env, NULL, object, "env");
++
++	// All events should be loaded by now, so the reference can be resolved
++	id = NULL;
++	GET_OPT_STR_FIELD(id, object, "event");
++	if (id) {
++		known_event = (KnownEvent *) nih_hash_lookup(known_events, id);
++		if (known_event == NULL) {
++			nih_error_raise_printf (LOAD_VALUE_MISSING,
++			       "%s: event='%s'", LOAD_VALUE_MISSING_STR, id);
++			goto error;
++		}
++	}
++	*target = event_operator_new(parent, type, name, env);
++	if (*target == NULL) {
++		nih_error_raise_no_memory ();
++		goto error;
++	}
++	if (known_event) {
++		(*target)->event = known_event->event;
++		event_block(known_event->event);
++		known_event->blockers--;
++	}
++	if (env) nih_discard(env);
++	return 0;
++error:
++	if (env) nih_free(env);
++	return -1;
++}
++
++/**
++ * load_strv:
++ * @target: pointer to the target variable,
++ * @parent: parent object for memory allocation,
++ * @list: list of ParsedStateValues to load.
++ *
++ * Load a string array and append it to @target. Used by the LOAD_STRV_FIELD
++ * and LOAD_OPT_STRV_FIELD macros.
++ *
++ * Returns: 0 on success, negative value on raised error.
++ */
++static int 
++load_strv(char ***target, const void * parent, NihList *list) 
++{
++	NIH_LIST_FOREACH(list, iter) {
++		ParsedStateValue *value = (ParsedStateValue *)iter;
++		if (value->type != VAL_STRING) {
++			nih_error_raise_printf (LOAD_TYPE_MISMATCH,
++			       "%s: string list item", LOAD_TYPE_MISMATCH_STR);
++			goto error;
++		}
++		if (value->string == NULL) {
++			nih_error_raise_printf (LOAD_TYPE_MISMATCH,
++			       "%s: string list item", LOAD_TYPE_MISMATCH_STR);
++			goto error;
++		}
++		if (!nih_str_array_add(target, parent, NULL, value->string)) {
++			nih_error_raise_no_memory ();
++			return -1;
++		}
++	}
++	return 0;
++error:
++	if (!parent && *target) nih_free(*target);
++	*target = NULL;
++	return -1;
++}
++
++#if 0
++/**
++ * is_field_defined:
++ * @object: a 'JSON object',
++ * @field: name of a field to probe.
++ *
++ * Check for @field existence in @object;
++ *
++ * Returns: 1 if @object contains field named @field (the value may be 'null'),
++ *          0 otherwise.
++ */
++static int 
++is_field_defined (ParsedStateValue *object, const char *field)
++{
++	ParsedStateValue * value;
++	nih_assert(object->type == VAL_HASH);
++	value = (ParsedStateValue *) nih_hash_lookup(object->hash, field);
++	return (value != NULL);
++}
++
++/**
++ * is_field_null:
++ * @object: a 'JSON object',
++ * @field: name of a field to probe.
++ *
++ * Check for @field existence and value;
++ *
++ * Returns: 1 if @object does not contain field named @field or the field value
++ *          is null, 0 otherwise.
++ */
++static int 
++is_field_null (ParsedStateValue *object, const char *field)
++{
++	ParsedStateValue * value;
++	nih_assert(object->type == VAL_HASH);
++	value = (ParsedStateValue *) nih_hash_lookup(object->hash, field);
++	return (value == NULL || value->type == VAL_NULL);
++}
++
++/**
++ * is_field_not_null:
++ * @object: a 'JSON object',
++ * @field: name of a field to probe.
++ *
++ * Check @field value;
++ *
++ * Returns: 1 if @object contains field named @field and its value is not NULL,
++ *          0 otherwise.
++ */
++static int 
++is_field_not_null(ParsedStateValue *object, const char *field)
++{
++	ParsedStateValue * value;
++	nih_assert(object->type == VAL_HASH);
++	value = (ParsedStateValue *) nih_hash_lookup(object->hash, field);
++	return (value != NULL && value->type != VAL_NULL);
++}
++
++#endif
+
+=== added file 'init/load_state.h'
+--- init/load_state.h	1970-01-01 00:00:00 +0000
++++ init/load_state.h	2010-06-08 13:33:50 +0000
+@@ -0,0 +1,78 @@
++/* upstart
++ *
++ * Copyright © 2010
++ * Author: Jacek Konieczny <jajcus@jajcus.net>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2, as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++ */
++
++#ifndef INIT_LOAD_STATE_H
++#define INIT_LOAD_STATE_H
++
++#include <stdio.h>
++#include <nih/list.h>
++#include <nih/hash.h>
++
++/**
++ * ParsedStateValueType:
++ *
++ * Type of value in the parsed tree.
++ **/
++typedef enum parsed_state_value_type {
++	VAL_NULL,
++	VAL_STRING,
++	VAL_INTEGER,
++	VAL_LIST,
++	VAL_HASH
++} ParsedStateValueType;
++
++/**
++ * ParsedStateValue:
++ * @entry: list header (only valid for values in lists or hash tables),
++ * @key: key for a value which is a field of an JSON object,
++ * @type: type of the value,
++ * @string: the value when type == VAL_STRING,
++ * @integer: the value when type == VAL_INTEGER,
++ * @list: the value (list of other ParsedStateValue objects) when type ==
++ *        VAL_LIST,
++ * @hash: the value (hash table of other ParsedStateValue objects) when type ==
++ *        VAL_HASH.
++ *
++ * This structure holds any value in the parsed state. Used during parsing
++ * and to represent the parsed tree.
++ **/
++typedef struct parsed_state_value {
++	NihList entry;
++	char *key;
++	ParsedStateValueType type;
++	union 
++	{
++		char *string;
++		long long int integer;
++		NihList *list;
++		NihHash *hash;
++	};
++} ParsedStateValue;
++
++void load_state_init();
++int load_state(void)
++    __attribute__ ((warn_unused_result));
++int load_state_from(FILE *source)
++    __attribute__ ((warn_unused_result));
++
++/* implemented by parse_state.y */
++ParsedStateValue * parse_state(FILE *source)
++			__attribute__ ((warn_unused_result, malloc));
++
++#endif				/* INIT_LOAD_STATE_H */
+
+=== modified file 'init/main.c'
+--- init/main.c	2010-02-26 15:29:07 +0000
++++ init/main.c	2010-06-08 13:33:50 +0000
+@@ -57,6 +57,9 @@
+ #include "event.h"
+ #include "conf.h"
+ #include "control.h"
++#include "save_state.h"
++#include "reexec.h"
++#include "load_state.h"
+ 
+ 
+ /* Prototypes for static functions */
+@@ -67,18 +70,12 @@
+ static void pwr_handler     (void *data, NihSignal *signal);
+ static void hup_handler     (void *data, NihSignal *signal);
+ static void usr1_handler    (void *data, NihSignal *signal);
++static void usr2_handler    (void *data, NihSignal *signal);
++static void term_handler    (void *data, NihSignal *signal);
+ #endif /* DEBUG */
+ 
+ 
+ /**
+- * argv0:
+- *
+- * Path to program executed, used for re-executing the init binary from the
+- * same location we were executed from.
+- **/
+-static const char *argv0 = NULL;
+-
+-/**
+  * restart:
+  *
+  * This is set to TRUE if we're being re-exec'd by an existing init
+@@ -263,6 +260,14 @@
+ 	/* SIGUSR1 instructs us to reconnect to D-Bus */
+ 	nih_signal_set_handler (SIGUSR1, nih_signal_handler);
+ 	NIH_MUST (nih_signal_add_handler (NULL, SIGUSR1, usr1_handler, NULL));
++	
++	/* SIGUSR2 instructs us to dump state */
++	nih_signal_set_handler (SIGUSR2, nih_signal_handler);
++	NIH_MUST (nih_signal_add_handler (NULL, SIGUSR2, usr2_handler, NULL));
++	
++	/* SIGTERM instructs us to re-exec */
++	nih_signal_set_handler (SIGTERM, nih_signal_handler);
++	NIH_MUST (nih_signal_add_handler (NULL, SIGTERM, term_handler, NULL));
+ #endif /* DEBUG */
+ 
+ 
+@@ -271,13 +276,10 @@
+ 				       job_process_handler, NULL));
+ 
+ 	/* Process the event queue each time through the main loop */
+-	NIH_MUST (nih_main_loop_add_func (NULL, (NihMainLoopCb)event_poll,
+-					  NULL));
+-
++	event_register_poll();
+ 
+ 	/* Read configuration */
+ 	NIH_MUST (conf_source_new (NULL, CONFFILE, CONF_FILE));
+-	NIH_MUST (conf_source_new (NULL, CONFDIR, CONF_JOB_DIR));
+ 
+ 	conf_reload ();
+ 
+@@ -323,9 +325,42 @@
+ 	 * init daemon that exec'd us
+ 	 */
+ 	if (! restart) {
++		NIH_MUST (conf_source_new (NULL, CONFDIR, CONF_JOB_DIR));
++		conf_reload ();
+ 		NIH_MUST (event_new (NULL, STARTUP_EVENT, NULL));
+ 	} else {
+ 		sigset_t mask;
++		int load_ok;
++		int default_source_known;
++
++		load_ok = NIH_SHOULD(load_state() != -1);
++		if (!load_ok) {
++			NihError *error;
++
++			error = nih_error_get ();
++			nih_warn ("%s: %s", 
++				  _("Unable to load saved state"),
++				  error->message);
++			nih_free (error);
++			// TODO: do something the system is usable or
++			//       shuts down as cleanly as possible
++		}
++		nih_info(_("State restored, loading current config"));
++
++		default_source_known = 0;
++		NIH_LIST_FOREACH(conf_sources, iter) {
++			ConfSource *source = (ConfSource *)iter;
++			if (!strcmp(source->path, CONFDIR)) {
++				default_source_known = 1;
++				break;
++			}
++		}
++
++		if (!default_source_known) {
++			NIH_MUST (conf_source_new (NULL, CONFDIR, CONF_JOB_DIR));
++		}
++
++		conf_reload ();
+ 
+ 		/* We're ok to receive signals again */
+ 		sigemptyset (&mask);
+@@ -414,6 +449,9 @@
+ 			    ? "segmentation fault" : "abort"));
+ 	}
+ 
++	/* so the state dump can be read up to the place when SEGV occured */
++	sync();
++
+ 	/* Goodbye, cruel world. */
+ 	exit (signum);
+ }
+@@ -507,4 +545,46 @@
+ 		}
+ 	}
+ }
++
++/**
++ * usr2_handler:
++ * @data: unused,
++ * @signal: signal that called this handler.
++ *
++ * Handle having recieved the SIGUSR2 signal, which we use to instruct us to
++ * save current state.
++ **/
++static void
++usr2_handler (void      *data,
++	      NihSignal *signal)
++{
++	nih_info (_("Saving current state"));
++	if (save_state()) 
++	{
++		NihError * err = nih_error_get ();
++		nih_warn ("%s: %s", _("Unable save state"), err->message);
++		nih_free (err);
++	}
++}
++
++/**
++ * term_handler:
++ * @data: unused,
++ * @signal: signal that called this handler.
++ *
++ * Handle having recieved the SIGTERM signal, which we use to instruct us to
++ * start the re-exec procedure.
++ **/
++static void
++term_handler (void      *data,
++	      NihSignal *signal)
++{
++	if (reexec_stage) {
++		nih_info (_("SIGTERM received, but re-exec already in progress"));
++		return;
++	}
++	nih_info (_("SIGTERM received, starting re-exec"));
++	reexec_start();
++}
++
+ #endif /* DEBUG */
+
+=== modified file 'init/paths.h'
+--- init/paths.h	2010-02-26 15:27:14 +0000
++++ init/paths.h	2010-06-08 13:33:50 +0000
+@@ -103,5 +103,14 @@
+ #define TELINIT SBINDIR "/telinit"
+ #endif
+ 
++/**
++ * STATE_DUMP_FILE:
++ *
++ * Internal state will be saved to this file on re-exec and SIGUSR2.
++ **/
++
++#ifndef STATE_DUMP_FILE
++#define STATE_DUMP_FILE "/upstart.state"
++#endif
+ 
+ #endif /* INIT_PATHS_H */
+
+=== modified file 'init/process.h'
+--- init/process.h	2009-06-23 09:29:35 +0000
++++ init/process.h	2010-06-08 13:33:50 +0000
+@@ -28,6 +28,9 @@
+  *
+  * This is used to enumerate the array of process definitions attached to
+  * a job class, and the array of pids attached to a job instance.
++ *
++ * NOTE: changing order or values of these enums may break loading
++ * saved state, as these are indexes to a few arrays saved.
+  **/
+ typedef enum process_type {
+ 	PROCESS_MAIN,
+
+=== added file 'init/reexec.c'
+--- init/reexec.c	1970-01-01 00:00:00 +0000
++++ init/reexec.c	2010-06-08 13:33:50 +0000
+@@ -0,0 +1,290 @@
++/* upstart
++ *
++ * reexec.c - re-exec the init process
++ *
++ * Copyright © 2010
++ * Author: Jacek Konieczny <jajcus@jajcus.net>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2, as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++ */
++
++#ifdef HAVE_CONFIG_H
++# include <config.h>
++#endif				/* HAVE_CONFIG_H */
++
++#include <unistd.h>
++
++#include <nih/hash.h>
++#include <nih/main.h>
++#include <nih/alloc.h>
++#include <nih/logging.h>
++#include <nih/timer.h>
++#include <nih/error.h>
++
++#include "dbus/upstart.h"
++#include "blocked.h"
++#include "job_class.h"
++#include "job.h"
++#include "event.h"
++#include "control.h"
++#include "reexec.h"
++#include "save_state.h"
++
++
++/**
++ * argv0:
++ *
++ * Path to program executed, used for re-executing the init binary from the
++ * same location we were executed from.
++ **/
++const char *argv0 = NULL;
++
++/**
++ * reexec_stage:
++ *
++ * 0 when reexec is not in progress, 1, 2 or 3 otherwise.
++ **/
++int reexec_stage = 0;
++
++static void reexec_defer_blocking_calls(NihList * blocking);
++static void reexec_stage2(void *data, NihTimer * timer);
++static void reexec_stage3(void *data, NihTimer * timer);
++static void reexec_abort();
++
++/**
++ * reexec_start:
++ *
++ * Start the re-exec procedure.
++ *
++ * Stops accepting new control connection and requests on the existing
++ * connections. Existing connections stay open so we can send out our
++ * re-exec-related messages. Method calls already started will be aborted
++ * with error reply.
++ *
++ *  Returns: 0 on success.
++ **/
++int
++reexec_start()
++{
++	/* mark re-exec in-progress */
++	reexec_stage = 1;
++
++	/* Stop polling events. The new init will handle them. */
++	event_unregister_poll();
++
++	/* Stop accepting new connections on the private bus */
++	control_server_close();
++
++	/* Reject any new method calls on existing connections */
++	control_reject_calls(DBUS_INTERFACE_UPSTART ".Error.TryAgain",
++			     "Init restarting, request refused");
++
++	/* Schedule start of the next re-exec stage */
++	if (!nih_timer_add_timeout
++	    (NULL, REEXEC_STAGE2_DELAY, reexec_stage2, NULL))
++		reexec_stage2(NULL, NULL);
++
++	/* Handle pending method calls. */
++	NIH_HASH_FOREACH(job_classes, iter) {
++		JobClass *job_class = (JobClass *) iter;
++		NIH_HASH_FOREACH(job_class->instances, iter2) {
++			Job *job = (Job *) iter2;
++			reexec_defer_blocking_calls(&job->blocking);
++		}
++	}
++	NIH_LIST_FOREACH(events, iter) {
++		Event *event = (Event *) iter;
++		reexec_defer_blocking_calls(&event->blocking);
++	}
++	return 0;
++}
++
++/**
++ * reexec_defer_blocking_calls:
++ *
++ * Reply to the blocking method calls.
++ *
++ * Currently it just rejects the calls with error. In future it should
++ * allow method call restart.
++ *
++ **/
++static void
++reexec_defer_blocking_calls(NihList * blocking)
++{
++
++	NIH_LIST_FOREACH(blocking, iter) {
++		Blocked *blocked = (Blocked *) iter;
++		switch (blocked->type) {
++		case BLOCKED_JOB:
++		case BLOCKED_EVENT:
++			continue;
++		case BLOCKED_EMIT_METHOD:
++		case BLOCKED_JOB_START_METHOD:
++		case BLOCKED_JOB_STOP_METHOD:
++		case BLOCKED_JOB_RESTART_METHOD:
++		case BLOCKED_INSTANCE_START_METHOD:
++		case BLOCKED_INSTANCE_STOP_METHOD:
++		case BLOCKED_INSTANCE_RESTART_METHOD:
++			break;
++		default:
++			continue;
++		}
++		NIH_ZERO(nih_dbus_message_error(blocked->message,
++						DBUS_INTERFACE_UPSTART
++						".Error.TryAgain", "%s",
++						_
++						("Init restarting, request still in progress")));
++	}
++}
++
++/**
++ * reexec_stage2:
++ *
++ * Stage 2 of the re-exec procedure.
++ *
++ * Close all controll connections, stop signals. Do not re-exec yet,
++ * so the connections may be gracefully stopped.
++ **/
++static void
++reexec_stage2(void *data, NihTimer * timer)
++{
++
++	sigset_t mask;
++
++	reexec_stage = 2;
++	nih_info(_("Re-exec stage 2"));
++
++	/* Close all control connections */
++	control_close_all_conns();
++	if (control_bus)
++		control_bus_close();
++
++	/* Stop signals */
++	sigfillset(&mask);
++	sigaddset(&mask, SIGALRM);
++	sigprocmask(SIG_SETMASK, &mask, NULL);
++
++	/* Schedule the final stage */
++	if (!nih_timer_add_timeout
++	    (NULL, REEXEC_STAGE3_DELAY, reexec_stage3, NULL))
++		reexec_stage3(NULL, NULL);
++}
++
++/**
++ * reexec_stage3:
++ *
++ * Final of the re-exec procedure.
++ *
++ * Save state and re-exec the init process.
++ **/
++static void
++reexec_stage3(void *data, NihTimer * timer)
++{
++
++	sigset_t mask;
++	const char *log_level_option = NULL;
++
++	reexec_stage = 3;
++	nih_info(_("Re-exec stage 3"));
++
++	/* Stop all signals */
++	sigfillset(&mask);
++	sigprocmask(SIG_SETMASK, &mask, NULL);
++
++	/* Save state, abort re-exec on error */
++	if (save_state()) {
++		NihError *error = nih_error_get();
++		nih_warn(_("State save failed (%s), aborting re-exec"),
++			 error->message);
++		nih_free(error);
++		reexec_abort();
++		return;
++	}
++
++	if (nih_log_priority <= NIH_LOG_DEBUG)
++		log_level_option = "--debug";
++	else if (nih_log_priority <= NIH_LOG_DEBUG)
++		log_level_option = "--verbose";
++	nih_info(_("Execing: %s --restart %s"), argv0,
++		 log_level_option ? log_level_option : "");
++	sync();
++	execl(argv0, argv0, "--restart", log_level_option, NULL);
++
++	nih_warn(_("State save failed (%i), aborting re-exec"), errno);
++	reexec_abort();
++}
++
++/**
++ * reexec_abort:
++ *
++ * Abort the re-exec procedure.
++ *
++ * Restore signal handling and control connections.
++ **/
++static void
++reexec_abort()
++{
++	sigset_t mask;
++
++	/* Remove the filters rejecting DBus method calls */
++	nih_debug("unrejecting calls");
++	control_unreject_calls();
++
++	/* Create a listening server for private connections. */
++	nih_debug("opening private servers");
++	while (control_server_open() < 0) {
++		NihError *err;
++
++		err = nih_error_get();
++		if (err->number != ENOMEM) {
++			nih_warn("%s: %s",
++				 _
++				 ("Unable to listen for private connections"),
++				 err->message);
++			nih_free(err);
++			break;
++		}
++		nih_free(err);
++	}
++
++	/* Open connection to the system bus; we normally expect this to
++	 * fail and will try again later - don't let ENOMEM stop us though.
++	 */
++	nih_debug("connecting to the system bus");
++	while (control_bus_open() < 0) {
++		NihError *err;
++		int number;
++
++		err = nih_error_get();
++		number = err->number;
++		nih_debug("error (%i): %s", number, err->message);
++		nih_free(err);
++
++		if (number != ENOMEM)
++			break;
++	}
++
++	/* Allow event polling again */
++	nih_debug("adding event_poll() to the main loop");
++	event_register_poll();
++
++	/* Unblock signals */
++	nih_debug("unblocking signals");
++	sigemptyset(&mask);
++	sigprocmask(SIG_SETMASK, &mask, NULL);
++
++	/* Lower the re-exec-in-progress flag */
++	reexec_stage = 0;
++}
++
+
+=== added file 'init/reexec.h'
+--- init/reexec.h	1970-01-01 00:00:00 +0000
++++ init/reexec.h	2010-06-08 13:33:50 +0000
+@@ -0,0 +1,47 @@
++/* upstart
++ *
++ * Copyright © 2010
++ * Author: Jacek Konieczny <jajcus@jajcus.net>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2, as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++ */
++
++#ifndef INIT_REEXEC_H
++#define INIT_REEXEC_H
++
++/**
++ * REEXEC_STAGE2_DELAY:
++ *
++ * Time before re-exec is started and stage2 (closing control connections) is
++ * entered.
++ */
++#define REEXEC_STAGE2_DELAY 5
++
++/**
++ * REEXEC_STAGE3_DELAY:
++ *
++ * Time before re-exec is started and stage3 (actual re-exec) is entered.
++ */
++#define REEXEC_STAGE3_DELAY 5
++
++NIH_BEGIN_EXTERN 
++
++extern const char *argv0;
++extern int reexec_stage;
++
++int reexec_start();
++
++NIH_END_EXTERN
++
++#endif				/* INIT_REEXEC_H */
+
+=== added file 'init/save_state.c'
+--- init/save_state.c	1970-01-01 00:00:00 +0000
++++ init/save_state.c	2010-06-08 13:33:50 +0000
+@@ -0,0 +1,1410 @@
++/* upstart
++ *
++ * save_state.c - save current init state
++ *
++ * Copyright © 2010
++ * Author: Jacek Konieczny <jajcus@jajcus.net>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2, as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++ */
++
++#ifdef HAVE_CONFIG_H
++# include <config.h>
++#endif				/* HAVE_CONFIG_H */
++
++#include <stdio.h>
++#include <errno.h>
++#include <string.h>
++#include <unistd.h>
++#include <time.h>
++#include <limits.h>
++
++#include <nih/main.h>
++#include <nih/macros.h>
++#include <nih/string.h>
++#include <nih/list.h>
++#include <nih/hash.h>
++#include <nih/logging.h>
++#include <nih/error.h>
++
++#include "paths.h"
++#include "environ.h"
++#include "process.h"
++#include "job_class.h"
++#include "job.h"
++#include "event_operator.h"
++#include "blocked.h"
++#include "conf.h"
++#include "control.h"
++#include "save_state.h"
++
++/* macros to simplify string output with basic error handling */
++
++/**
++ * WRITE:
++ * @format:  printf format sting
++ * @...:     format parameters
++ *
++ * Macro that writes a string to 'stream' (local variable).
++ *
++ * On I/O error raises system error and goes to 'error' label
++ **/
++#define WRITE(format, ...) \
++	do { \
++		errno = 0; \
++		if (fprintf(stream, format, ##__VA_ARGS__) < 0) { \
++			if (errno == 0) \
++				errno = EIO; \
++			nih_error_raise_system(); \
++			goto error; \
++		} \
++	} while (0)
++
++/**
++ * WRITE_FIELD:
++ * @name:    field name (const char *)
++ * @dumper:  value dumper (function to serialize the value)
++ * @...:     format parameters
++ *
++ * Write a JSON "name": value pair. Outputs '"@name": ' string
++ * and calls the @dumper to write the value (defined by the remaining
++ * arguments).
++ *
++ * On I/O error raises system error and goes to 'error' label
++ **/
++#define WRITE_FIELD(name, dumper, ...) \
++	do { \
++		WRITE("\"%s\": ", name); \
++		if (dumper(stream, ##__VA_ARGS__)) goto error; \
++	} while(0)
++
++/**
++ * WRITE_STR_FIELD:
++ * @name:    field name (const char *)
++ * @value:   field value (const char *)
++ *
++ * Write a JSON string field ("@name": "@value") to the stream.
++ *
++ * On I/O error raises system error and goes to 'error' label
++ **/
++#define WRITE_STR_FIELD(name, value) \
++	WRITE_FIELD(name, dump_string, value)
++
++/**
++ * WRITE_STRV_FIELD:
++ * @name:    field name (const char *)
++ * @value:   field values (char **, NULL-terminated)
++ *
++ * Write a JSON string list field ("@name": ["@value[0]", ...]).
++ *
++ * On I/O error raises system error and goes to 'error' label
++ **/
++#define WRITE_STRV_FIELD(name, value) \
++	WRITE_FIELD(name, dump_strv, value)
++
++/**
++ * WRITE_NULL_FIELD:
++ * @name:    field name (const char *)
++ *
++ * Write a JSON null field ("@name": null).
++ *
++ * On I/O error raises system error and goes to 'error' label
++ **/
++#define WRITE_NULL_FIELD(name) \
++	WRITE("\"%s\": null", name);
++
++/**
++ * WRITE_NULL_FIELD:
++ * @name:    field name (const char *)
++ * @value:   field value (void *)
++ *
++ * Write a 'object id'. This is a string representation of the pointer @value
++ * or 'null'.
++ *
++ * On I/O error raises system error and goes to 'error' label
++ **/
++#define WRITE_ID_FIELD(name, value) \
++	WRITE_FIELD(name, dump_id, value)
++
++/**
++ * WRITE_INT_FIELD:
++ * @name:	field name (const char *)
++ * @value:	value (any integer)
++ *
++ * Write a signed integer field to the stream ("@name": @value).
++ * Will properly handle integer of any size up to sizeof(long long int).
++ *
++ * On I/O error raises system error and goes to 'error' label
++ **/
++#define WRITE_INT_FIELD(name, value) \
++	WRITE("\"%s\": %lli", name, (long long int)(value));
++
++/**
++ * WRITE_UINT_FIELD:
++ * @name:	field name (const char *)
++ * @value:	value (any integer)
++ *
++ * Write a unsigned integer field to the stream ("@name": @value).
++ * Will properly handle integer of any size up to sizeof(unsigned long long in).
++ *
++ * On I/O error raises system error and goes to 'error' label
++ **/
++#define WRITE_UINT_FIELD(name, value) \
++	WRITE("\"%s\": %llu", name, (unsigned long long int)(value));
++
++/**
++ * WRITE_UINT_FIELD:
++ * @name:	field name (const char *)
++ * @value:	the array of integers (e.g. 'int *' or 'ssize_t *')
++ * @len:	number of elements in the array 
++ *
++ * Write a unsigned integer list field ("@name": [@value[0], @value[1], ...])
++ * to the stream.
++ *
++ * Implemented as macro to be type-agnostic.
++ *
++ * On I/O error raises system error and goes to 'error' label
++ **/
++#define WRITE_INT_ARRAY_FIELD(name, value, len) \
++	do { \
++		WRITE("\"%s\": ", name); \
++		if (value == NULL) { \
++			WRITE("null"); \
++			break; \
++		} \
++		WRITE("["); \
++		int first = TRUE; \
++		for (unsigned i = 0; i < (unsigned)len; i++) { \
++			if (!first) \
++				WRITE(", "); \
++			WRITE("%lli", (long long int)value[i]); \
++			first = FALSE; \
++		} \
++		WRITE("]"); \
++	} while (0)
++
++/**
++ * WRITE_HASH_FIELD:
++ * @name:	field name (const char *)
++ * @dumper:	function to dump into the stream an object from the hash
++ * @value:	the hash to dump (NihHash *)
++ *
++ * Write a hash table of items into the stream as an JSON object.
++ *
++ * The @dumper function will be called for each element of the hash table
++ * and is expected to dump the object value into the stream.
++ *
++ * On I/O error raises system error and goes to 'error' label
++ **/
++#define WRITE_HASH_FIELD(name, dumper, value) \
++	WRITE_FIELD(name, dump_hash, dumper, value)
++
++/**
++ * WRITE_LIST_FIELD:
++ * @name:	field name (const char *)
++ * @dumper:	function to dump into the stream an object from the list 
++ * @value:	the list to dump (NihList *)
++ *
++ * Write a list of items into the stream as an JSON list.
++ *
++ * The @dumper function will be called for each element of the list
++ * and is expected to dump the object value into the stream.
++ *
++ * On I/O error raises system error and goes to 'error' label
++ **/
++#define WRITE_LIST_FIELD(name, dumper, value) \
++	WRITE_FIELD(name, dump_list, dumper, value)
++
++/**
++ * WRITE_TREE_FIELD:
++ * @name:	field name (const char *)
++ * @dumper:	function to dump into the stream an object from the tree
++ * @value:	the list to dump (NihTree *)
++ *
++ * Write a the tree of items into the stream as nested JSON objects.
++ *
++ * The @dumper function will be called for tree node
++ * and is expected to dump the node value into the stream.
++ *
++ * On I/O error raises system error and goes to 'error' label
++ **/
++#define WRITE_TREE_FIELD(name, dumper, value) \
++	WRITE_FIELD(name, dump_tree, dumper, (NihTree *)value)
++
++/** DumperFunction:
++ * @stream:	the stream where the object should be written to
++ * @obj:	pointer to the object
++ *
++ * Type for a function used to dump an object from a container.
++ */
++typedef int DumperFunction(FILE * stream, void *obj);
++
++/* Prototypes for static functions */
++static int dump_meta(FILE * stream)
++    __attribute__ ((warn_unused_result));
++static int dump_conf_source(FILE * stream, void *obj)
++    __attribute__ ((warn_unused_result));
++static int dump_conf_file(FILE * stream, void *obj)
++    __attribute__ ((warn_unused_result));
++static int dump_event(FILE * stream, void *obj)
++    __attribute__ ((warn_unused_result));
++static int dump_blocked(FILE * stream, void *obj)
++    __attribute__ ((warn_unused_result));
++static int dump_event_progress(FILE * stream, EventProgress progress)
++    __attribute__ ((warn_unused_result));
++static int dump_job_class(FILE * stream, void *obj)
++    __attribute__ ((warn_unused_result));
++static int dump_job(FILE * stream, void *obj)
++    __attribute__ ((warn_unused_result));
++static int dump_event_operator(FILE * stream, void *obj)
++    __attribute__ ((warn_unused_result));
++static int dump_event_operator_type(FILE * stream,
++				    EventOperatorType optype)
++    __attribute__ ((warn_unused_result));
++static int dump_nih_timer(FILE * stream, NihTimer * timer)
++    __attribute__ ((warn_unused_result));
++static int dump_nih_timer_schedule(FILE * stream,
++				   NihTimerSchedule * schedule)
++    __attribute__ ((warn_unused_result));
++static int dump_job_state(FILE * stream, JobState state)
++    __attribute__ ((warn_unused_result));
++static int dump_job_goal(FILE * stream, JobGoal goal)
++    __attribute__ ((warn_unused_result));
++static int dump_trace_state(FILE * stream, TraceState trace_state)
++    __attribute__ ((warn_unused_result));
++static int dump_process(FILE * stream, void *obj)
++    __attribute__ ((warn_unused_result));
++static int dump_rlimit(FILE * stream, void *rlim)
++    __attribute__ ((warn_unused_result));
++static int dump_process_type(FILE * stream, ProcessType ptype)
++    __attribute__ ((warn_unused_result));
++static int dump_expect_type(FILE * stream, ExpectType expect)
++    __attribute__ ((warn_unused_result));
++static int dump_console_type(FILE * stream, ConsoleType console)
++    __attribute__ ((warn_unused_result));
++static int dump_hash(FILE * stream, DumperFunction object_dumper,
++		     NihHash * hash)
++    __attribute__ ((warn_unused_result));
++static int dump_tree(FILE * stream, DumperFunction object_dumper,
++		     NihTree * tree)
++    __attribute__ ((warn_unused_result));
++static int dump_list(FILE * stream, DumperFunction object_dumper,
++		     NihList * list)
++    __attribute__ ((warn_unused_result));
++static int dump_array(FILE * stream, DumperFunction object_dumper,
++		      void **value, int len)
++    __attribute__ ((warn_unused_result));
++static int dump_string(FILE * stream, const char *value)
++    __attribute__ ((warn_unused_result));
++static int dump_id(FILE * stream, const void *value)
++    __attribute__ ((warn_unused_result));
++static int dump_strv(FILE * stream, char **value)
++    __attribute__ ((warn_unused_result));
++
++/**
++ * save_state:
++ *
++ * Saves whole internal Upstart state to STATE_DUMP_FILE
++ *
++ * Returns: zero on success, negative value when an error is raised.
++ **/
++int
++save_state()
++{
++	FILE *fd;
++	int rc;
++
++	fd = fopen(STATE_DUMP_FILE, "w");
++	if (fd == NULL) {
++		nih_error_raise_system();
++		return -1;
++	}
++	// makes debuging easier
++	setvbuf(fd, NULL, _IONBF, 0);
++
++	rc = dump_state(fd);
++
++	if (fclose(fd)) {
++		nih_error_raise_system();
++		rc = -1;
++	}
++	return rc;
++}
++
++/**
++ * dump_state:
++ * @stream: stdio stream where the state should be saved
++ *
++ * Saves whole internal Upstart state to the @stream.
++ *
++ * Returns: zero on success, negative value when an error is raised.
++ **/
++int
++dump_state(FILE * stream)
++{
++
++	nih_assert(stream != NULL);
++
++	WRITE("{\n");
++	WRITE_FIELD("meta", dump_meta);
++	WRITE(",\n");
++	WRITE_LIST_FIELD("conf_sources", dump_conf_source, conf_sources);
++	WRITE(",\n");
++	WRITE_LIST_FIELD("events", dump_event, events);
++	WRITE(",\n");
++	WRITE_HASH_FIELD("job_classes", dump_job_class, job_classes);
++	WRITE("}\n");
++	return 0;
++      error:
++	return -1;
++}
++
++/**
++ * dump_meta:
++ * @stream: stream where write the meta-data to.
++ *
++ * Writes some meta-data for the state dump.
++ * Written data is not actual Upstart internal state dump, but
++ * rather some information tha can help interpreting it.
++ *
++ * Please note, that some information stored here may be very inaccurate
++ * and useful only for reference. That is because current time or hostname
++ * may be not well defined when only init is running.
++ *
++ * Returns: zero on success, negative value when an error is raised.
++ **/
++static int
++dump_meta(FILE * stream)
++{
++	char hostname[HOST_NAME_MAX];
++
++	if (gethostname(hostname, HOST_NAME_MAX))
++		hostname[0] = '\000';
++
++	WRITE("{\n");
++	WRITE_STR_FIELD("generator", package_string);
++	WRITE(",\n");
++	WRITE_STR_FIELD("format_version", "0.0");
++	WRITE(",\n");
++	WRITE_STR_FIELD("host", hostname);
++	WRITE(",\n");
++	WRITE_INT_FIELD("time", time(NULL));
++	WRITE("\n}");
++	return 0;
++      error:
++	return -1;
++}
++
++/**
++ * dump_conf_source:
++ * @stream: stdio stream where the state should be saved to
++ * @obj:    pointer to the object to dump
++ *
++ * Dumps a ConfSource object to the @stream.
++ *
++ * Returns: zero on success, negative value when an error is raised.
++ **/
++static int
++dump_conf_source(FILE * stream, void *obj)
++{
++	ConfSource *source = (ConfSource *) obj;
++
++	WRITE("{\n");
++	WRITE_ID_FIELD("id", source);
++	WRITE(",\n");
++	WRITE_STR_FIELD("path", source->path);
++	WRITE(",\n");
++	switch(source->type) {
++	case CONF_FILE:
++		WRITE_STR_FIELD("type", "file");
++		break;
++	case CONF_DIR:
++		WRITE_STR_FIELD("type", "dir");
++		break;
++	case CONF_JOB_DIR:
++		WRITE_STR_FIELD("type", "job-dir");
++		break;
++	default:
++		WRITE("\"type\": \"%i\",\n", source->type);
++		break;
++	}
++	WRITE(",\n");
++	WRITE_INT_FIELD("flag", source->flag);
++	WRITE(",\n");
++	WRITE_HASH_FIELD("files", dump_conf_file, source->files);
++	WRITE("\n}");
++	return 0;
++      error:
++	return -1;
++}
++
++/**
++ * dump_conf_file:
++ * @stream: stdio stream where the state should be saved to
++ * @obj:    pointer to the object to dump
++ *
++ * Dumps a ConfFile object to the @stream.
++ *
++ * Returns: zero on success, negative value when an error is raised.
++ **/
++static int
++dump_conf_file(FILE * stream, void *obj)
++{
++	ConfFile *file = (ConfFile *) obj;
++
++	WRITE("{\n");
++	WRITE_ID_FIELD("id", file);
++	WRITE(",\n");
++	WRITE_STR_FIELD("path", file->path);
++	WRITE(",\n");
++	WRITE_ID_FIELD("source", file->source);
++	WRITE(",\n");
++	WRITE_INT_FIELD("flag", file->flag);
++	WRITE(",\n");
++	switch(file->source->type) {
++	case CONF_JOB_DIR:
++		WRITE_ID_FIELD("job", file->job);
++		break;
++	default:
++		WRITE_ID_FIELD("data", file->data);
++		break;
++	}
++	WRITE("\n}");
++	return 0;
++      error:
++	return -1;
++}
++
++/**
++ * dump_event:
++ * @stream: stdio stream where the state should be saved to
++ * @obj:    pointer to the object to dump
++ *
++ * Dumps an Event object to the @stream.
++ *
++ * Returns: zero on success, negative value when an error is raised.
++ **/
++static int
++dump_event(FILE * stream, void *obj)
++{
++	Event *event = (Event *) obj;
++
++	WRITE("{\n");
++	WRITE_ID_FIELD("id", event);
++	WRITE(",\n");
++	WRITE_STR_FIELD("name", event->name);
++	WRITE(",\n");
++	WRITE_STRV_FIELD("env", event->env);
++	WRITE(",\n");
++	WRITE_FIELD("progress", dump_event_progress,
++		    event->progress);
++	WRITE(",\n");
++	WRITE_INT_FIELD("failed", event->failed);
++	WRITE(",\n");
++	WRITE_INT_FIELD("blockers", event->blockers);
++	WRITE(",\n");
++	WRITE_LIST_FIELD("blocking", dump_blocked, &event->blocking);
++	WRITE("\n}");
++	return 0;
++      error:
++	return -1;
++}
++
++/**
++ * dump_blocked:
++ * @stream: stdio stream where the state should be saved
++ * @obj:    pointer to the object to dump
++ *
++ * Dumps an Blocked object to the @stream.
++ *
++ * Returns: zero on success, negative value when an error is raised.
++ **/
++static int
++dump_blocked(FILE * stream, void *obj)
++{
++	Blocked *blocked = (Blocked *) obj;
++
++	WRITE("{\n");
++	WRITE_ID_FIELD("id", blocked);
++	WRITE(",\n");
++	switch (blocked->type) {
++	case BLOCKED_JOB:
++		WRITE_STR_FIELD("type", "job");
++		break;
++	case BLOCKED_EVENT:
++		WRITE_STR_FIELD("type", "event");
++		break;
++	case BLOCKED_EMIT_METHOD:
++		WRITE_STR_FIELD("type", "emit_method");
++		break;
++	case BLOCKED_JOB_START_METHOD:
++		WRITE_STR_FIELD("type", "job_start_method");
++		break;
++	case BLOCKED_JOB_STOP_METHOD:
++		WRITE_STR_FIELD("type", "job_stop_method");
++		break;
++	case BLOCKED_JOB_RESTART_METHOD:
++		WRITE_STR_FIELD("type", "job_restart_method");
++		break;
++	case BLOCKED_INSTANCE_START_METHOD:
++		WRITE_STR_FIELD("type", "instance_start_method");
++		break;
++	case BLOCKED_INSTANCE_STOP_METHOD:
++		WRITE_STR_FIELD("type", "instance_stop_method");
++		break;
++	case BLOCKED_INSTANCE_RESTART_METHOD:
++		WRITE_STR_FIELD("type", "instance_restart_method");
++		break;
++	default:
++		WRITE("\"type\": \"%i\",\n", blocked->type);
++		break;
++	}
++	WRITE(",\n");
++	switch (blocked->type) {
++	case BLOCKED_JOB:
++		WRITE_ID_FIELD("job", blocked->job);
++		break;
++	case BLOCKED_EVENT:
++		WRITE_ID_FIELD("event", blocked->event);
++		break;
++	case BLOCKED_EMIT_METHOD:
++	case BLOCKED_JOB_START_METHOD:
++	case BLOCKED_JOB_STOP_METHOD:
++	case BLOCKED_JOB_RESTART_METHOD:
++	case BLOCKED_INSTANCE_START_METHOD:
++	case BLOCKED_INSTANCE_STOP_METHOD:
++	case BLOCKED_INSTANCE_RESTART_METHOD:
++		WRITE_ID_FIELD("message", blocked->message);
++		break;
++	default:
++		WRITE_ID_FIELD("data", blocked->data);
++		break;
++	}
++	WRITE("\n}");
++	return 0;
++      error:
++	return -1;
++}
++
++/**
++ * dump_event_progress:
++ * @stream:	stdio stream where the state should be saved to
++ * @progress:	the value to dump
++ *
++ * Dumps an EventProgress value to the @stream.
++ *
++ * Returns: zero on success, negative value when an error is raised.
++ **/
++static int
++dump_event_progress(FILE * stream, EventProgress progress)
++{
++
++	switch (progress) {
++	case EVENT_PENDING:
++		if (dump_string(stream, "pending"))
++			goto error;
++		break;
++	case EVENT_HANDLING:
++		if (dump_string(stream, "handling"))
++			goto error;
++		break;
++	case EVENT_FINISHED:
++		if (dump_string(stream, "finished"))
++			goto error;
++		break;
++	default:
++		WRITE("\"%i\"", progress);
++		break;
++	}
++	return 0;
++      error:
++	return -1;
++}
++
++/**
++ * dump_job_class:
++ * @stream: stdio stream where the state should be saved to
++ * @obj:    pointer to the object to dump
++ *
++ * Dumps a JobClass object to the @stream.
++ *
++ * Returns: zero on success, negative value when an error is raised.
++ **/
++static int
++dump_job_class(FILE * stream, void *obj)
++{
++	JobClass *job_class = (JobClass *) obj;
++
++	WRITE("{\n");
++	WRITE_ID_FIELD("id", job_class);
++	WRITE(",\n");
++	WRITE_STR_FIELD("name", job_class->name);
++	WRITE(",\n");
++	WRITE_STR_FIELD("path", job_class->path);
++	WRITE(",\n");
++	WRITE_STR_FIELD("instance", job_class->instance);
++	WRITE(",\n");
++	// instaces go later, so JobClass is quite complete when they are loaded
++	WRITE_STR_FIELD("description", job_class->description);
++	WRITE(",\n");
++	WRITE_STR_FIELD("author", job_class->author);
++	WRITE(",\n");
++	WRITE_STR_FIELD("version", job_class->version);
++	WRITE(",\n");
++	WRITE_STRV_FIELD("env", job_class->env);
++	WRITE(",\n");
++	WRITE_STRV_FIELD("export", job_class->export);
++	WRITE(",\n");
++	WRITE_TREE_FIELD("start_on", dump_event_operator,
++			 job_class->start_on);
++	WRITE(",\n");
++	WRITE_TREE_FIELD("stop_on", dump_event_operator,
++			 job_class->stop_on);
++	WRITE(",\n");
++	WRITE_STRV_FIELD("emits", job_class->emits);
++	WRITE(",\n");
++	WRITE_FIELD("process", dump_array, dump_process,
++		    (void **) job_class->process, PROCESS_LAST);
++	WRITE(",\n");
++	WRITE_FIELD("expect", dump_expect_type, job_class->expect);
++	WRITE(",\n");
++	WRITE_INT_FIELD("task", job_class->task);
++	WRITE(",\n");
++	WRITE_INT_FIELD("kill_timeout", job_class->kill_timeout);
++	WRITE(",\n");
++	WRITE_INT_FIELD("respawn", job_class->respawn);
++	WRITE(",\n");
++	WRITE_INT_FIELD("respawn_limit", job_class->respawn_limit);
++	WRITE(",\n");
++	WRITE_INT_FIELD("respawn_interval", job_class->respawn_interval);
++	WRITE(",\n");
++	WRITE_INT_ARRAY_FIELD("normalexit", job_class->normalexit,
++			      job_class->normalexit_len);
++	WRITE(",\n");
++	WRITE_FIELD("console", dump_console_type, job_class->console);
++	WRITE(",\n");
++	WRITE_INT_FIELD("nice", job_class->nice);
++	WRITE(",\n");
++	WRITE_INT_FIELD("oom_adj", job_class->oom_adj);
++	WRITE(",\n");
++	WRITE_FIELD("limits", dump_array, dump_rlimit,
++		    (void **) job_class->limits, RLIMIT_NLIMITS);
++	WRITE(",\n");
++	WRITE_STR_FIELD("chroot", job_class->chroot);
++	WRITE(",\n");
++	WRITE_STR_FIELD("chdir", job_class->chdir);
++	WRITE(",\n");
++	WRITE_INT_FIELD("deleted", job_class->deleted);
++	WRITE(",\n");
++	WRITE_HASH_FIELD("instances", dump_job, job_class->instances);
++	WRITE("\n}");
++	return 0;
++      error:
++	return -1;
++}
++
++/**
++ * dump_job:
++ * @stream: stdio stream where the state should be saved to
++ * @obj:    pointer to the object to dump
++ *
++ * Dumps a Job object to the @stream.
++ *
++ * Returns: zero on success, negative value when an error is raised.
++ **/
++static int
++dump_job(FILE * stream, void *obj)
++{
++	Job *job = (Job *) obj;
++
++	WRITE("{\n");
++	WRITE_ID_FIELD("id", job);
++	WRITE(",\n");
++	WRITE_STR_FIELD("name", job->name);
++	WRITE(",\n");
++	WRITE_ID_FIELD("class", job->class);
++	WRITE(",\n");
++	WRITE_STR_FIELD("path", job->path);
++	WRITE(",\n");
++	WRITE_FIELD("goal", dump_job_goal, job->goal);
++	WRITE(",\n");
++	WRITE_FIELD("state", dump_job_state, job->state);
++	WRITE(",\n");
++	WRITE_STRV_FIELD("env", job->env);
++	WRITE(",\n");
++	WRITE_STRV_FIELD("start_env", job->start_env);
++	WRITE(",\n");
++	WRITE_STRV_FIELD("stop_env", job->stop_env);
++	WRITE(",\n");
++	WRITE_TREE_FIELD("stop_on", dump_event_operator, job->stop_on);
++	WRITE(",\n");
++	WRITE_INT_ARRAY_FIELD("pid", job->pid, PROCESS_LAST);
++	WRITE(",\n");
++	WRITE_ID_FIELD("blocker", job->blocker);
++	WRITE(",\n");
++	WRITE_LIST_FIELD("blocking", dump_blocked, &job->blocking);
++	WRITE(",\n");
++	WRITE_FIELD("kill_timer", dump_nih_timer, job->kill_timer);
++	WRITE(",\n");
++	WRITE_FIELD("kill_process", dump_process_type, job->kill_process);
++	WRITE(",\n");
++	WRITE_INT_FIELD("failed", job->failed);
++	WRITE(",\n");
++	WRITE_FIELD("failed_process", dump_process_type,
++		    job->failed_process);
++	WRITE(",\n");
++	WRITE_INT_FIELD("exit_status", job->exit_status);
++	WRITE(",\n");
++	WRITE_INT_FIELD("respawn_time", job->respawn_time);
++	WRITE(",\n");
++	WRITE_INT_FIELD("respawn_count", job->respawn_count);
++	WRITE(",\n");
++	WRITE_INT_FIELD("trace_forks", job->trace_forks);
++	WRITE(",\n");
++	WRITE_FIELD("trace_state", dump_trace_state, job->trace_state);
++	WRITE("\n}");
++	return 0;
++      error:
++	return -1;
++}
++
++/**
++ * dump_nih_timer:
++ * @stream:	stdio stream where the state should be saved to
++ * @timer:	pointer to the object to dump
++ *
++ * Dumps a NihTimer object to the @stream.
++ *
++ * Returns: zero on success, negative value when an error is raised.
++ **/
++static int
++dump_nih_timer(FILE * stream, NihTimer * timer)
++{
++	if (timer == NULL) {
++		WRITE("null");
++		return 0;
++	}
++	WRITE("{\n");
++	WRITE_ID_FIELD("id", timer);
++	WRITE(",\n");
++	WRITE_INT_FIELD("due", timer->due);
++	WRITE(",\n");
++	switch (timer->type) {
++	case NIH_TIMER_TIMEOUT:
++		WRITE_STR_FIELD("type", "timeout");
++		WRITE(",\n");
++		WRITE_INT_FIELD("timeout", timer->timeout);
++		WRITE(",\n");
++		break;
++	case NIH_TIMER_PERIODIC:
++		WRITE_STR_FIELD("type", "periodic");
++		WRITE(",\n");
++		WRITE_INT_FIELD("period", timer->period);
++		WRITE(",\n");
++		break;
++	case NIH_TIMER_SCHEDULED:
++		WRITE_STR_FIELD("type", "scheduled");
++		WRITE(",\n");
++		WRITE_FIELD("schedule", dump_nih_timer_schedule,
++			    &timer->schedule);
++		WRITE(",\n");
++		break;
++	default:
++		WRITE("\"type\": \"%i\",\n", timer->type);
++		break;
++	}
++	WRITE_ID_FIELD("callback", timer->callback);
++	WRITE(",\n");
++	WRITE_ID_FIELD("data", timer->data);
++	WRITE("\n}");
++	return 0;
++      error:
++	return -1;
++}
++
++/**
++ * dump_nih_timer_schedule:
++ * @stream:	stdio stream where the state should be saved to
++ * @schedule:	pointer to the value to dump
++ *
++ * Dumps a NihTimerSchedule value to the @stream.
++ *
++ * Returns: zero on success, negative value when an error is raised.
++ **/
++static int
++dump_nih_timer_schedule(FILE * stream, NihTimerSchedule * schedule)
++{
++	WRITE("{\n");
++	WRITE_UINT_FIELD("minutes", schedule->minutes);
++	WRITE(",\n");
++	WRITE_UINT_FIELD("hours", schedule->hours);
++	WRITE(",\n");
++	WRITE_UINT_FIELD("mdays", schedule->mdays);
++	WRITE(",\n");
++	WRITE_UINT_FIELD("months", schedule->months);
++	WRITE(",\n");
++	WRITE_UINT_FIELD("wdays", schedule->wdays);
++	WRITE("\n}");
++	return 0;
++      error:
++	return -1;
++}
++
++/**
++ * dump_event_operator:
++ * @stream: stdio stream where the state should be saved to
++ * @obj:    pointer to the object to dump
++ *
++ * Dumps an EventOperator object to the @stream.
++ *
++ * Returns: zero on success, negative value when an error is raised.
++ **/
++static int
++dump_event_operator(FILE * stream, void *obj)
++{
++	EventOperator *event_operator = (EventOperator *) obj;
++
++	WRITE("{\n");
++	WRITE_ID_FIELD("id", event_operator);
++	WRITE(",\n");
++	WRITE_FIELD("type", dump_event_operator_type,
++		    event_operator->type);
++	WRITE(",\n");
++	WRITE_INT_FIELD("value", event_operator->value);
++	WRITE(",\n");
++	WRITE_STR_FIELD("name", event_operator->name);
++	WRITE(",\n");
++	WRITE_STRV_FIELD("env", event_operator->env);
++	WRITE(",\n");
++	WRITE_ID_FIELD("event", event_operator->event);
++	WRITE("\n}");
++	return 0;
++      error:
++	return -1;
++}
++
++/**
++ * dump_event_operator_type:
++ * @stream:	stdio stream where the state should be saved to
++ * @optype:	the value to dump
++ *
++ * Dumps an EventOperatorType value to the @stream.
++ *
++ * Returns: zero on success, negative value when an error is raised.
++ **/
++static int
++dump_event_operator_type(FILE * stream, EventOperatorType optype)
++{
++
++	switch (optype) {
++	case EVENT_OR:
++		if (dump_string(stream, "or"))
++			goto error;
++		break;
++	case EVENT_AND:
++		if (dump_string(stream, "and"))
++			goto error;
++		break;
++	case EVENT_MATCH:
++		if (dump_string(stream, "match"))
++			goto error;
++		break;
++	default:
++		WRITE("\"%i\"", optype);
++		break;
++	}
++	return 0;
++      error:
++	return -1;
++}
++
++/**
++ * dump_process:
++ * @stream: stdio stream where the state should be saved to
++ * @obj:    pointer to the object to dump
++ *
++ * Dumps a Process object to the @stream.
++ *
++ * Returns: zero on success, negative value when an error is raised.
++ **/
++static int
++dump_process(FILE * stream, void *obj)
++{
++	Process *process = (Process *) obj;
++
++	WRITE("{\n");
++	WRITE_INT_FIELD("script", process->script);
++	WRITE(",\n");
++	WRITE_STR_FIELD("command", process->command);
++	WRITE("\n}");
++	return 0;
++      error:
++	return -1;
++}
++
++/**
++ * dump_rlimit:
++ * @stream: stdio stream where the state should be saved to
++ * @obj:    pointer to the object to dump
++ *
++ * Dumps a struct rlimit object to the @stream.
++ *
++ * Returns: zero on success, negative value when an error is raised.
++ **/
++static int
++dump_rlimit(FILE * stream, void *obj)
++{
++	struct rlimit *rlim = (struct rlimit *) obj;
++
++	WRITE("{\n");
++	WRITE_UINT_FIELD("soft", rlim->rlim_cur);
++	WRITE(",\n");
++	WRITE_UINT_FIELD("hard", rlim->rlim_max);
++	WRITE("\n}");
++	return 0;
++      error:
++	return -1;
++}
++
++/**
++ * dump_job_goal:
++ * @stream:	stdio stream where the state should be saved to
++ * @goal:	the value to dump
++ *
++ * Dumps a JobGoal value to the @stream.
++ *
++ * Returns: zero on success, negative value when an error is raised.
++ **/
++static int
++dump_job_goal(FILE * stream, JobGoal goal)
++{
++
++	const char *name = job_goal_name(goal);
++	if (name) {
++		if (dump_string(stream, name))
++			goto error;
++	} else {
++		WRITE("\"%i\"", goal);
++	}
++	return 0;
++      error:
++	return -1;
++}
++
++/**
++ * dump_job_state:
++ * @stream:	stdio stream where the state should be saved to
++ * @state:	the value to dump
++ *
++ * Dumps a JobState value to the @stream.
++ *
++ * Returns: zero on success, negative value when an error is raised.
++ **/
++static int
++dump_job_state(FILE * stream, JobState state)
++{
++	const char *name;
++	name = job_state_name(state);
++	if (name) {
++		if (dump_string(stream, name))
++			goto error;
++	} else {
++		WRITE("\"%i\"", state);
++	}
++	return 0;
++      error:
++	return -1;
++}
++
++/**
++ * dump_process_type:
++ * @stream:	stdio stream where the state should be saved to
++ * @ptype:	the value to dump
++ *
++ * Dumps a ProcessType value to the @stream.
++ *
++ * Returns: zero on success, negative value when an error is raised.
++ **/
++static int
++dump_process_type(FILE * stream, ProcessType ptype)
++{
++	const char *name;
++	name = process_name(ptype);
++	if (name) {
++		if (dump_string(stream, name))
++			goto error;
++	} else {
++		WRITE("\"%i\"", ptype);
++	}
++	return 0;
++      error:
++	return -1;
++}
++
++/**
++ * dump_trace_state:
++ * @stream:		stdio stream where the state should be saved to
++ * @trace_state:	the value to dump
++ *
++ * Dumps a TraceState value to the @stream.
++ *
++ * Returns: zero on success, negative value when an error is raised.
++ **/
++static int
++dump_trace_state(FILE * stream, TraceState trace_state)
++{
++
++	switch (trace_state) {
++	case TRACE_NONE:
++		if (dump_string(stream, "none"))
++			goto error;
++		break;
++	case TRACE_NEW:
++		if (dump_string(stream, "new"))
++			goto error;
++		break;
++	case TRACE_NEW_CHILD:
++		if (dump_string(stream, "new-child"))
++			goto error;
++		break;
++	case TRACE_NORMAL:
++		if (dump_string(stream, "normal"))
++			goto error;
++		break;
++	default:
++		WRITE("\"%i\"", trace_state);
++		break;
++	}
++	return 0;
++      error:
++	return -1;
++}
++
++/**
++ * dump_expect_type:
++ * @stream:	stdio stream where the state should be saved to
++ * @expect:	the value to dump
++ *
++ * Dumps an ExpectType value to the @stream.
++ *
++ * Returns: zero on success, negative value when an error is raised.
++ **/
++static int
++dump_expect_type(FILE * stream, ExpectType expect)
++{
++
++	switch (expect) {
++	case EXPECT_NONE:
++		if (dump_string(stream, "none"))
++			goto error;
++		break;
++	case EXPECT_STOP:
++		if (dump_string(stream, "stop"))
++			goto error;
++		break;
++	case EXPECT_DAEMON:
++		if (dump_string(stream, "daemon"))
++			goto error;
++		break;
++	case EXPECT_FORK:
++		if (dump_string(stream, "fork"))
++			goto error;
++		break;
++	default:
++		WRITE("\"%i\"", expect);
++		break;
++	}
++	return 0;
++      error:
++	return -1;
++}
++
++/**
++ * dump_console_type:
++ * @stream:	stdio stream where the state should be saved to
++ * @console:	the value to dump
++ *
++ * Dumps a ConsoleType value to the @stream.
++ *
++ * Returns: zero on success, negative value when an error is raised.
++ **/
++static int
++dump_console_type(FILE * stream, ConsoleType console)
++{
++
++	switch (console) {
++	case CONSOLE_NONE:
++		if (dump_string(stream, "none"))
++			goto error;
++		break;
++	case CONSOLE_OUTPUT:
++		if (dump_string(stream, "output"))
++			goto error;
++		break;
++	case CONSOLE_OWNER:
++		if (dump_string(stream, "owner"))
++			goto error;
++		break;
++	default:
++		WRITE("\"%i\"", console);
++		break;
++	}
++	return 0;
++      error:
++	return -1;
++}
++
++/**
++ * dump_tree:
++ * @stream:		stdio stream where the state should be saved to
++ * @object_dumper:	a function to dump values of the tree nodes
++ * @tree:		the tree to dump
++ *
++ * Dumps a tree to the @stream as JSON nested objects.
++ *
++ * Returns: zero on success, negative value when an error is raised.
++ **/
++static int
++dump_tree(FILE * stream, DumperFunction object_dumper, NihTree * tree)
++{
++	if (tree == NULL) {
++		WRITE("null");
++		return 0;
++	}
++	WRITE("{\n");
++	WRITE_FIELD("value", object_dumper, tree);
++	WRITE(",\n");
++	WRITE_FIELD("left", dump_tree, object_dumper, tree->left);
++	WRITE(",\n");
++	WRITE_FIELD("right", dump_tree, object_dumper, tree->right);
++	WRITE("\n}");
++	return 0;
++      error:
++	return -1;
++}
++
++/**
++ * dump_hash:
++ * @stream:		stdio stream where the state should be saved to
++ * @object_dumper:	a function to dump each object from the hash
++ * @hash:		the hash table to dump
++ *
++ * Dumps a hash table of objects to the @stream as a JSON object.
++ *
++ * Returns: zero on success, negative value when an error is raised.
++ **/
++static int
++dump_hash(FILE * stream, DumperFunction object_dumper, NihHash * hash)
++{
++	int first = TRUE;
++
++	if (hash == NULL) {
++		WRITE("null");
++		return 0;
++	}
++	WRITE("{\n");
++	NIH_HASH_FOREACH(hash, iter) {
++		if (!first)
++			WRITE(",\n");
++		WRITE_FIELD(nih_hash_string_key(iter), object_dumper,
++			    iter);
++		first = FALSE;
++	}
++	WRITE("\n}");
++	return 0;
++      error:
++	return -1;
++}
++
++/**
++ * dump_list:
++ * @stream:		stdio stream where the state should be saved to
++ * @object_dumper:	a function to dump the objects from the list
++ * @list:		the list to dump
++ *
++ * Dumps a hash table of objects to the @stream as a JSON object.
++ *
++ * Returns: zero on success, negative value when an error is raised.
++ **/
++static int
++dump_list(FILE * stream, DumperFunction object_dumper, NihList * list)
++{
++	int first = TRUE;
++
++	if (list == NULL) {
++		WRITE("null");
++		return 0;
++	} else if (NIH_LIST_EMPTY(list)) {
++		WRITE("[]");
++		return 0;
++	}
++
++	WRITE("[\n");
++	NIH_LIST_FOREACH(list, iter) {
++		if (!first)
++			WRITE(",\n");
++		object_dumper(stream, iter);
++		first = FALSE;
++	}
++	WRITE("\n]");
++	return 0;
++      error:
++	return -1;
++}
++
++/**
++ * dump_array:
++ * @stream:		stdio stream where the state should be saved to
++ * @object_dumper:	a function to dump the objects from the array
++ * @value:		the array pointer (address of the first item)
++ * @len:		number of objects in the array
++ *
++ * Dumps objects referenced by the array of pointers to the @stream as a JSON
++ * list.
++ *
++ * Returns: zero on success, negative value when an error is raised.
++ **/
++static int
++dump_array(FILE * stream, DumperFunction object_dumper, void **value,
++	   int len)
++{
++	int i;
++	int first = TRUE;
++
++	if (value == NULL) {
++		WRITE("null");
++		return 0;
++	}
++
++	WRITE("[");
++	for (i = 0; i < len; i++) {
++		if (!first)
++			WRITE(", ");
++		if (value[i] == NULL) {
++			WRITE("null");
++		} else {
++			object_dumper(stream, value[i]);
++		}
++		first = FALSE;
++	}
++	WRITE("]");
++	return 0;
++      error:
++	return -1;
++}
++
++/**
++ * dump_string:
++ * @stream:		stdio stream where the state should be saved to
++ * @value:		the string value to dump
++ *
++ * Dumps the string value as a JSON string literal.
++ *
++ * Returns: zero on success, negative value when an error is raised.
++ **/
++static int
++dump_string(FILE * stream, const char *value)
++{
++	int i;
++	int c;
++
++	if (value == NULL) {
++		WRITE("null");
++		return 0;
++	}
++
++	fputc('"', stream);
++	for (i = 0; value[i]; i++) {
++		c = (unsigned char) value[i];
++		if (c == '\n')
++			WRITE("\\n");
++		else if (c == '\b')
++			WRITE("\\b");
++		else if (c == '\f')
++			WRITE("\\f");
++		else if (c == '\r')
++			WRITE("\\r");
++		else if (c == '\t')
++			WRITE("\\t");
++		else if (c < 32)
++			WRITE("\\u%04x", c);
++		else if (c == '\\')
++			WRITE("\\\\");
++		else if (c == '"')
++			WRITE("\\\"");
++		else if (fputc(c, stream) == EOF)
++			goto error;
++	}
++	fputc('"', stream);
++	return 0;
++      error:
++	return -1;
++}
++
++/**
++ * dump_id:
++ * @stream:		stdio stream where the state should be saved to
++ * @value:		the value to dump
++ *
++ * Dumps a pointer as a JSON string as an 'object id'.
++ *
++ * Returns: zero on success, negative value when an error is raised.
++ **/
++static int
++dump_id(FILE * stream, const void *value)
++{
++	if (value == NULL) {
++		WRITE("null");
++		return 0;
++	}
++	WRITE("\"%p\"", value);
++	return 0;
++      error:
++	return -1;
++}
++
++/**
++ * dump_strv:
++ * @stream:		stdio stream where the state should be saved to
++ * @value:		the string array of strings to dump
++ *
++ * Dumps a NULL-terminated array of strings @value as a JSON list into the
++ * @strean.
++ *
++ * Returns: zero on success, negative value when an error is raised.
++ **/
++static int
++dump_strv(FILE * stream, char **value)
++{
++	int i;
++	int first = TRUE;
++
++	if (value == NULL) {
++		WRITE("null");
++		return 0;
++	}
++
++	WRITE("[");
++	for (i = 0; value[i]; i++) {
++		if (!first)
++			WRITE(", ");
++		if (dump_string(stream, value[i]))
++			goto error;
++		first = FALSE;
++	}
++	WRITE("]");
++	return 0;
++      error:
++	return -1;
++}
+
+=== added file 'init/save_state.h'
+--- init/save_state.h	1970-01-01 00:00:00 +0000
++++ init/save_state.h	2010-06-08 13:33:50 +0000
+@@ -0,0 +1,33 @@
++/* upstart
++ *
++ * Copyright © 2010
++ * Author: Jacek Konieczny <jajcus@jajcus.net>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2, as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++ */
++
++#ifndef INIT_SAVE_STATE_H
++#define INIT_SAVE_STATE_H
++
++#include <stdio.h>
++
++NIH_BEGIN_EXTERN 
++
++int save_state()
++    __attribute__ ((warn_unused_result));
++int dump_state(FILE * stream)
++    __attribute__ ((warn_unused_result));
++
++NIH_END_EXTERN
++#endif				/* INIT_SAVE_STATE_H */
+
+=== added file 'init/state_lexer.l'
+--- init/state_lexer.l	1970-01-01 00:00:00 +0000
++++ init/state_lexer.l	2010-06-08 13:33:50 +0000
+@@ -0,0 +1,97 @@
++/* upstart
++ *
++ * state_lexer.l - lexical scanner for the saved-state file format (JSON subset)
++ *
++ * Copyright © 2010
++ * Author: Jacek Konieczny <jajcus@jajcus.net>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2, as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++ */
++
++%{
++
++/*
++ * never fail on warnings in the flex-generated code
++ */
++#pragma GCC diagnostic warning "-Wsign-compare"
++#pragma GCC diagnostic warning "-Wunused-function"
++
++#include "load_state.h"
++#include "state_parser.h"
++
++extern int parser_restart;
++%}
++
++%x string
++/* %option debug */
++
++%%
++
++	/* start with the INITIAL state even if previous scanner run was
++ 	* aborted */
++	if (parser_restart) {
++		BEGIN(INITIAL);
++		parser_restart = 0;
++	}
++
++[ \r\f\t\n]   ;
++
++ /* integer, no other JSON numbers needed */
++-?[0-9]+	yylval.raw_integer = atoll(yytext); return INTEGER;
++
++ /* special values */
++null		return V_NULL;
++true		return V_TRUE;
++false		return V_FALSE;
++
++ /* operators */
++"["		return '[';
++"]"		return ']';
++":"		return ':';
++"{"		return '{';
++"}"		return '}';
++","		return ',';
++"-"		return '-';
++
++ /* strings are passed as '"', chunks of content, '"' */
++\"		BEGIN(string); return '"';
++<string>\\\"	yylval.raw_string = "\""; return QUOTED;
++<string>\\\\	yylval.raw_string = "\\"; return QUOTED;
++<string>\\\/	yylval.raw_string = "/"; return QUOTED;
++<string>\\b	yylval.raw_string = "\b"; return QUOTED;
++<string>\\f	yylval.raw_string = "\f"; return QUOTED;
++<string>\\n	yylval.raw_string = "\n"; return QUOTED;
++<string>\\r	yylval.raw_string = "\r"; return QUOTED;
++<string>\\t	yylval.raw_string = "\t"; return QUOTED;
++
++ /* handle misc control characters escaping */
++<string>\\u00[0-7][0-9a-f]	{
++		yytext[0] = (char)strtol(yytext + 3, NULL, 16);
++		yytext[1] = '\000';
++		yylval.raw_string = yytext; 
++		return QUOTED;
++		}
++
++ /* no unicode support here, pass other \uXXXX as-is */
++<string>\\u[0-9a-f]{4}	yylval.raw_string = yytext; return QUOTED;
++<string>[^"\\]+	yylval.raw_string = yytext; return QUOTED;
++<string>\"	BEGIN(INITIAL); return '"';
++
++.		yylval.raw_string = yytext; return BAD_INPUT;
++
++%%
++
++int yywrap() {
++	return 1;
++}
+
+=== added file 'init/state_parser.y'
+--- init/state_parser.y	1970-01-01 00:00:00 +0000
++++ init/state_parser.y	2010-06-08 13:33:50 +0000
+@@ -0,0 +1,224 @@
++/* upstart
++ *
++ * state_parser.y - parser for the saved-state file format (JSON subset)
++ *
++ * Copyright © 2010
++ * Author: Jacek Konieczny <jajcus@jajcus.net>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2, as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++ */
++
++%{
++#include "load_state.h"
++#include "errors.h"
++
++#include <nih/error.h>
++#include <nih/string.h>
++#include <nih/list.h>
++#include <nih/hash.h>
++#include <nih/alloc.h>
++#include <nih/logging.h>
++
++int yyerror(char *s);
++int yylex ();
++int yyparse ();
++#define YY_DECL int yylex (void)
++
++#define YYDEBUG 1
++#define YYERROR_VERBOSE 1
++
++ParsedStateValue *parsed_state;
++
++#define CHECK_OOM(ptr) \
++	do { \
++		if ((ptr) == NULL) { \
++			nih_error_raise_no_memory (); \
++			YYABORT; \
++		} \
++	} while(0)
++%}
++
++%union  {
++        char * raw_string;
++	long long int raw_integer;
++	ParsedStateValue value;
++        }
++
++%token <raw_string> QUOTED
++%token <raw_integer> INTEGER
++%token V_TRUE V_FALSE V_NULL
++%token BAD_INPUT
++
++%type <value> data object field fields list values value string quoted
++
++%start data
++
++
++%%
++
++data:	object  		
++		{ *parsed_state = $$ = $1; }
++    	;
++
++object:	'{' fields '}' 		
++      		{ $$ = $2; $$.type = VAL_HASH; }
++	| '{' '}'
++		{
++			$$.hash = nih_hash_string_new(parsed_state, 0);
++			CHECK_OOM($$.hash);
++			$$.type = VAL_HASH;
++		}
++      	;
++
++fields:	field
++      		{
++			$$.hash = nih_hash_string_new(parsed_state, 0);
++			CHECK_OOM($$.hash);
++			ParsedStateValue * value = nih_new($$.hash,
++						           ParsedStateValue);
++			CHECK_OOM(value);
++			*value = $1;
++			nih_list_init((NihList *)value);
++			nih_hash_add_unique($$.hash, (NihList *)value);
++		}
++      	| fields ',' field
++      		{
++			$$ = $1;
++			ParsedStateValue * value = nih_new($$.hash,
++						           ParsedStateValue);
++			CHECK_OOM(value);
++			*value = $3;
++			nih_list_init((NihList *)value);
++			nih_hash_add_unique($$.hash, (NihList *)value);
++		}
++
++	;
++
++field: string ':' value	
++     		{
++			$$ = $3;
++			$$.key = $1.string;
++		}
++	;
++
++list:	'[' values ']'		
++		{ $$ = $2; $$.type = VAL_LIST; }
++	| '[' ']'
++		{
++			$$.list = nih_list_new(parsed_state);
++			CHECK_OOM($$.list);
++			$$.type = VAL_LIST;
++		}
++    	;
++
++values:	value	
++		{
++			$$.list = nih_list_new(parsed_state);
++			CHECK_OOM($$.list);
++			ParsedStateValue * value = nih_new($$.list,
++						           ParsedStateValue);
++			CHECK_OOM(value);
++			*value = $1;
++			nih_list_init((NihList *)value);
++			nih_list_add($$.list, (NihList *)value);
++		}
++      	| values ',' value
++		{
++			$$ = $1;
++			ParsedStateValue * value = nih_new($$.list,
++						           ParsedStateValue);
++			CHECK_OOM(value);
++			*value = $3;
++			nih_list_init((NihList *)value);
++			nih_list_add($$.list, (NihList *)value);
++		}
++	;
++
++value:	string			
++     		{ $$ = $1; }
++     	| INTEGER		
++		{ $$.integer = $1; $$.type = VAL_INTEGER; }
++     	| '-' INTEGER		
++		{ $$.integer = - $2; $$.type = VAL_INTEGER; }
++	| V_TRUE		
++		{ $$.integer = 1; $$.type = VAL_INTEGER; }
++	| V_FALSE		
++		{ $$.integer = 0; $$.type = VAL_INTEGER; }
++	| V_NULL		
++		{ $$.type = VAL_NULL; }
++	| object		
++		{ $$ = $1; }
++	| list			
++		{ $$ = $1; }
++	;
++
++string:	'"' quoted '"'		
++      		{ $$ = $2;  $$.type = VAL_STRING; }
++	| '"' '"'
++		{ 
++			$$.string = nih_strdup(parsed_state, "");
++			CHECK_OOM($$.string);
++			$$.type = VAL_STRING;
++		}
++      	;
++
++quoted:	QUOTED		
++      		{
++			$$.string = nih_strdup(parsed_state, $1);
++			CHECK_OOM($$.string);
++		}
++      	| quoted QUOTED	
++		{
++			$$.string = nih_strcat(&$1.string, NULL, $2);
++			CHECK_OOM($$.string);
++		}
++	;
++
++%%
++
++#include <stdio.h>
++
++void yyrestart (FILE *input_file  );
++int parser_restart = 0;
++
++ParsedStateValue * 
++parse_state(FILE *source) 
++{
++	ParsedStateValue *result;
++
++	//yydebug = 1;
++	yyrestart(source);
++	parser_restart = 1;
++	result = parsed_state = (ParsedStateValue *)nih_alloc(NULL,
++						 sizeof(ParsedStateValue));
++	if (result == NULL) {
++		nih_error_raise_no_memory ();
++		return NULL;
++        }
++	parsed_state->type = VAL_NULL;
++	if (yyparse()) {
++		nih_free(parsed_state);
++		result = NULL;
++	}
++	parsed_state = NULL;
++	return result;
++}
++
++
++int yyerror(char *s) {
++	nih_error_raise (STATE_PARSE_ERROR, STATE_PARSE_ERROR_STR);
++	nih_info (_("Saved state parse error: %s"), s);
++	return 0;
++}
++
+
+=== added file 'init/tests/test_load_state.c'
+--- init/tests/test_load_state.c	1970-01-01 00:00:00 +0000
++++ init/tests/test_load_state.c	2010-06-08 13:33:50 +0000
+@@ -0,0 +1,104 @@
++/* upstart
++ *
++ * test_load_state.c - test suite for init/load_state.c
++ *
++ * Copyright © 2010
++ * Author: Jacek Konieczny <jajcus@jajcus.net>.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2, as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++ */
++
++#include <limits.h>
++#include <stdlib.h>
++
++#include <nih/main.h>
++#include <nih/logging.h>
++#include <nih/string.h>
++#include <nih/test.h>
++#include <nih/error.h>
++
++#include "load_state.h"
++#include "event.h"
++#include "job.h"
++#include "conf.h"
++#include "control.h"
++
++static char * 
++get_filename(const char *name) 
++{
++
++	const char *srcdir;
++
++	srcdir = getenv("srcdir");
++	if (!srcdir) srcdir = ".";
++
++	return nih_sprintf(NULL, "%s/tests/%s", srcdir, name);
++}
++
++void
++test_sample_data(void)
++{
++	FILE *f;
++	char *filename;
++	int count;
++	int rc;
++
++	nih_error_init ();
++	nih_timer_init ();
++	nih_log_init ();
++	conf_init ();
++	event_init ();
++	control_init ();
++	job_class_init ();
++	nih_main_loop_init ();
++	load_state_init ();
++
++	TEST_FUNCTION("load_state_from");
++	
++	TEST_FEATURE("first sample data file");
++
++	filename = get_filename("test_load_state.data1");
++	TEST_ALLOC_FAIL {
++		f = fopen(filename, "r");
++		rc = load_state_from(f);
++		fclose(f);
++		if (test_alloc_failed) {
++			TEST_EQ(rc, -1);
++			NihError *err;
++			err = nih_error_get();
++			TEST_EQ(err->number, ENOMEM);
++			nih_free(err);
++			continue;
++		}
++		TEST_EQ(rc, 0);
++		TEST_NE_P(events, NULL);
++		count = 0;
++		NIH_LIST_FOREACH(events, iter) count++;
++		TEST_EQ(count, 1);
++		TEST_NE_P(job_classes, NULL);
++		count = 0;
++		NIH_HASH_FOREACH(job_classes, iter) count++;
++		TEST_EQ(count, 16);
++	}
++	nih_free(filename);
++}
++
++
++int
++main(int argc, char *argv[])
++{
++
++	test_sample_data();
++	return 0;
++}
+
+=== added file 'init/tests/test_load_state.data1'
+--- init/tests/test_load_state.data1	1970-01-01 00:00:00 +0000
++++ init/tests/test_load_state.data1	2010-06-08 13:33:50 +0000
+@@ -0,0 +1,1423 @@
++{
++"meta": {
++"generator": "testinit (upstart 0.6.7)",
++"format_version": "0.0",
++"host": "guest",
++"time": 1275666270
++},
++"conf_sources": [
++{
++"id": "0x807f408",
++"path": "/usr/local/etc/init.conf",
++"type": "file",
++"flag": 0,
++"files": {
++
++}
++},
++{
++"id": "0x807fff0",
++"path": "/usr/local/etc/init",
++"type": "job-dir",
++"flag": 1,
++"files": {
++"/usr/local/etc/init/control-alt-delete.conf": {
++"id": "0x8081548",
++"path": "/usr/local/etc/init/control-alt-delete.conf",
++"source": "0x807fff0",
++"flag": 1,
++"job": "0x8081748"
++},
++"/usr/local/etc/init/rc.conf": {
++"id": "0x8084340",
++"path": "/usr/local/etc/init/rc.conf",
++"source": "0x807fff0",
++"flag": 1,
++"job": "0x8083d00"
++},
++"/usr/local/etc/init/tty.conf": {
++"id": "0x8088e68",
++"path": "/usr/local/etc/init/tty.conf",
++"source": "0x807fff0",
++"flag": 1,
++"job": "0x8089040"
++},
++"/usr/local/etc/init/syslog-ng.conf": {
++"id": "0x8086ee0",
++"path": "/usr/local/etc/init/syslog-ng.conf",
++"source": "0x807fff0",
++"flag": 1,
++"job": "0x80875f0"
++},
++"/usr/local/etc/init/rcS-sulogin.conf": {
++"id": "0x8083c60",
++"path": "/usr/local/etc/init/rcS-sulogin.conf",
++"source": "0x807fff0",
++"flag": 1,
++"job": "0x8085068"
++},
++"/usr/local/etc/init/test2.conf": {
++"id": "0x80874e8",
++"path": "/usr/local/etc/init/test2.conf",
++"source": "0x807fff0",
++"flag": 1,
++"job": "0x8088180"
++},
++"/usr/local/etc/init/sshd.conf": {
++"id": "0x8084e50",
++"path": "/usr/local/etc/init/sshd.conf",
++"source": "0x807fff0",
++"flag": 1,
++"job": "0x80858a0"
++},
++"/usr/local/etc/init/test.conf": {
++"id": "0x80875b0",
++"path": "/usr/local/etc/init/test.conf",
++"source": "0x807fff0",
++"flag": 1,
++"job": "0x8087c98"
++},
++"/usr/local/etc/init/rcS.conf": {
++"id": "0x8085270",
++"path": "/usr/local/etc/init/rcS.conf",
++"source": "0x807fff0",
++"flag": 1,
++"job": "0x8084f10"
++},
++"/usr/local/etc/init/start-ttys.conf": {
++"id": "0x8086c58",
++"path": "/usr/local/etc/init/start-ttys.conf",
++"source": "0x807fff0",
++"flag": 1,
++"job": "0x80865f8"
++},
++"/usr/local/etc/init/messagebus.conf": {
++"id": "0x8082b10",
++"path": "/usr/local/etc/init/messagebus.conf",
++"source": "0x807fff0",
++"flag": 1,
++"job": "0x8082150"
++},
++"/usr/local/etc/init/random.conf": {
++"id": "0x8083940",
++"path": "/usr/local/etc/init/random.conf",
++"source": "0x807fff0",
++"flag": 1,
++"job": "0x80834a8"
++},
++"/usr/local/etc/init/crond.conf": {
++"id": "0x8080ca0",
++"path": "/usr/local/etc/init/crond.conf",
++"source": "0x807fff0",
++"flag": 1,
++"job": "0x80818e8"
++},
++"/usr/local/etc/init/test3.conf": {
++"id": "0x8088398",
++"path": "/usr/local/etc/init/test3.conf",
++"source": "0x807fff0",
++"flag": 1,
++"job": "0x8088a98"
++},
++"/usr/local/etc/init/cherokee.conf": {
++"id": "0x8080b38",
++"path": "/usr/local/etc/init/cherokee.conf",
++"source": "0x807fff0",
++"flag": 1,
++"job": "0x8080dc8"
++},
++"/usr/local/etc/init/ntpd.conf": {
++"id": "0x8081f48",
++"path": "/usr/local/etc/init/ntpd.conf",
++"source": "0x807fff0",
++"flag": 1,
++"job": "0x8081fd0"
++}
++}
++}
++],
++"events": [
++{
++"id": "0x80903f0",
++"name": "starting",
++"env": ["JOB=test", "INSTANCE="],
++"progress": "handling",
++"failed": 0,
++"blockers": 1,
++"blocking": [
++{
++"id": "0x80904b0",
++"type": "job",
++"job": "0x8089f40"
++}
++]
++}
++],
++"job_classes": {
++"rc": {
++"id": "0x8083d00",
++"name": "rc",
++"path": "/com/ubuntu/Upstart/jobs/rc",
++"instance": "",
++"description": "rc - System V runlevel compatibility This task runs the old sysv-rc runlevel scripts.  It is usually started by the telinit compatibility wrapper.",
++"author": null,
++"version": null,
++"env": null,
++"export": ["RUNLEVEL"],
++"start_on": {
++"value": {
++"id": "0x8084a98",
++"type": "match",
++"value": 0,
++"name": "runlevel",
++"env": ["[0123456]"],
++"event": null
++},
++"left": null,
++"right": null
++},
++"stop_on": {
++"value": {
++"id": "0x8084bf0",
++"type": "match",
++"value": 0,
++"name": "runlevel",
++"env": ["[!$RUNLEVEL]"],
++"event": null
++},
++"left": null,
++"right": null
++},
++"emits": ["shutdown"],
++"process": [{
++"script": 0,
++"command": "/etc/rc.d/rc $RUNLEVEL"
++}, null, null, null, null],
++"expect": "none",
++"task": 1,
++"kill_timeout": 5,
++"respawn": 0,
++"respawn_limit": 10,
++"respawn_interval": 5,
++"normalexit": null,
++"console": "output",
++"nice": 0,
++"oom_adj": 0,
++"limits": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
++"chroot": null,
++"chdir": null,
++"deleted": 0,
++"instances": {
++
++}
++},
++"sshd": {
++"id": "0x80858a0",
++"name": "sshd",
++"path": "/com/ubuntu/Upstart/jobs/sshd",
++"instance": "",
++"description": null,
++"author": null,
++"version": null,
++"env": null,
++"export": null,
++"start_on": {
++"value": {
++"id": "0x8086ac0",
++"type": "and",
++"value": 0,
++"name": null,
++"env": null,
++"event": null
++},
++"left": {
++"value": {
++"id": "0x80868e8",
++"type": "and",
++"value": 0,
++"name": null,
++"env": null,
++"event": null
++},
++"left": {
++"value": {
++"id": "0x8086810",
++"type": "match",
++"value": 0,
++"name": "pld.network-started",
++"env": null,
++"event": null
++},
++"left": null,
++"right": null
++},
++"right": {
++"value": {
++"id": "0x8086990",
++"type": "match",
++"value": 0,
++"name": "started",
++"env": ["SERVICE=syslog"],
++"event": null
++},
++"left": null,
++"right": null
++}
++},
++"right": {
++"value": {
++"id": "0x8086b00",
++"type": "match",
++"value": 0,
++"name": "started",
++"env": ["random"],
++"event": null
++},
++"left": null,
++"right": null
++}
++},
++"stop_on": {
++"value": {
++"id": "0x8086cc8",
++"type": "match",
++"value": 0,
++"name": "pld.shutdown-started",
++"env": null,
++"event": null
++},
++"left": null,
++"right": null
++},
++"emits": null,
++"process": [{
++"script": 1,
++"command": "\t. /etc/rc.d/init.d/functions\n\t. /etc/sysconfig/network\n\n  \tif [ ! -s /etc/ssh/ssh_host_key ] ; then\n\t\t/etc/rc.d/init.d/sshd init\n  \tfi\n\n\tif is_yes \"$IPV4_NETWORKING\" && is_no \"$IPV6_NETWORKING\"; then\n\t\tOPTIONS=\"$OPTIONS -4\"\n\tfi\n\tif is_yes \"$IPV6_NETWORKING\" && is_no \"$IPV4_NETWORKING\"; then\n\t\tOPTIONS=\"$OPTIONS -6\"\n\tfi\n\n\texec /usr/sbin/sshd -D $OPTIONS\n"
++}, null, null, null, null],
++"expect": "none",
++"task": 0,
++"kill_timeout": 5,
++"respawn": 1,
++"respawn_limit": 10,
++"respawn_interval": 5,
++"normalexit": null,
++"console": "output",
++"nice": 0,
++"oom_adj": 0,
++"limits": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
++"chroot": null,
++"chdir": null,
++"deleted": 0,
++"instances": {
++"": {
++"id": "0x8089c00",
++"name": "",
++"class": "0x80858a0",
++"path": "/com/ubuntu/Upstart/jobs/sshd/_",
++"goal": "start",
++"state": "running",
++"env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/sbin:/bin:NONE/sbin", "TERM=linux", "JOB=random", "INSTANCE=", "SERVICE=syslog", "UPSTART_EVENTS=pld.network-started started started"],
++"start_env": null,
++"stop_env": null,
++"stop_on": {
++"value": {
++"id": "0x808b098",
++"type": "match",
++"value": 0,
++"name": "pld.shutdown-started",
++"env": null,
++"event": null
++},
++"left": null,
++"right": null
++},
++"pid": [1620, 0, 0, 0, 0],
++"blocker": null,
++"blocking": [],
++"kill_timer": null,
++"kill_process": "-1",
++"failed": 0,
++"failed_process": "-1",
++"exit_status": 0,
++"respawn_time": 0,
++"respawn_count": 0,
++"trace_forks": 0,
++"trace_state": "none"
++}
++}
++},
++"test": {
++"id": "0x8087c98",
++"name": "test",
++"path": "/com/ubuntu/Upstart/jobs/test",
++"instance": "",
++"description": "test",
++"author": null,
++"version": null,
++"env": null,
++"export": null,
++"start_on": null,
++"stop_on": null,
++"emits": null,
++"process": [{
++"script": 1,
++"command": "exec python -c 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(1000)'\n"
++}, null, null, null, null],
++"expect": "none",
++"task": 0,
++"kill_timeout": 5,
++"respawn": 1,
++"respawn_limit": 10,
++"respawn_interval": 5,
++"normalexit": [0, 1, 2, 3],
++"console": "none",
++"nice": 0,
++"oom_adj": 0,
++"limits": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
++"chroot": null,
++"chdir": null,
++"deleted": 0,
++"instances": {
++"": {
++"id": "0x8089f40",
++"name": "",
++"class": "0x8087c98",
++"path": "/com/ubuntu/Upstart/jobs/test/_",
++"goal": "start",
++"state": "starting",
++"env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/sbin:/bin:NONE/sbin", "TERM=linux"],
++"start_env": null,
++"stop_env": null,
++"stop_on": null,
++"pid": [0, 0, 0, 0, 0],
++"blocker": "0x80903f0",
++"blocking": [
++{
++"id": "0x808fdf0",
++"type": "job_start_method",
++"message": "0x808dae8"
++}
++],
++"kill_timer": null,
++"kill_process": "-1",
++"failed": 0,
++"failed_process": "-1",
++"exit_status": 0,
++"respawn_time": 0,
++"respawn_count": 0,
++"trace_forks": 0,
++"trace_state": "none"
++}
++}
++},
++"tty": {
++"id": "0x8089040",
++"name": "tty",
++"path": "/com/ubuntu/Upstart/jobs/tty",
++"instance": "$TTY",
++"description": null,
++"author": null,
++"version": null,
++"env": null,
++"export": null,
++"start_on": null,
++"stop_on": {
++"value": {
++"id": "0x8089410",
++"type": "match",
++"value": 0,
++"name": "runlevel",
++"env": ["[016]"],
++"event": null
++},
++"left": null,
++"right": null
++},
++"emits": null,
++"process": [{
++"script": 0,
++"command": "/sbin/mingetty --noclear $TTY"
++}, null, null, null, null],
++"expect": "none",
++"task": 0,
++"kill_timeout": 5,
++"respawn": 1,
++"respawn_limit": 10,
++"respawn_interval": 5,
++"normalexit": null,
++"console": "none",
++"nice": 0,
++"oom_adj": 0,
++"limits": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
++"chroot": null,
++"chdir": null,
++"deleted": 0,
++"instances": {
++"/dev/tty1": {
++"id": "0x808c598",
++"name": "/dev/tty1",
++"class": "0x8089040",
++"path": "/com/ubuntu/Upstart/jobs/tty/_2fdev_2ftty1",
++"goal": "start",
++"state": "running",
++"env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/sbin:/bin:NONE/sbin", "TERM=linux", "TTY=/dev/tty1"],
++"start_env": null,
++"stop_env": null,
++"stop_on": {
++"value": {
++"id": "0x8089ff0",
++"type": "match",
++"value": 0,
++"name": "runlevel",
++"env": ["[016]"],
++"event": null
++},
++"left": null,
++"right": null
++},
++"pid": [1705, 0, 0, 0, 0],
++"blocker": null,
++"blocking": [],
++"kill_timer": null,
++"kill_process": "-1",
++"failed": 0,
++"failed_process": "-1",
++"exit_status": 0,
++"respawn_time": 0,
++"respawn_count": 0,
++"trace_forks": 0,
++"trace_state": "none"
++},
++"/dev/ttyS0": {
++"id": "0x808f610",
++"name": "/dev/ttyS0",
++"class": "0x8089040",
++"path": "/com/ubuntu/Upstart/jobs/tty/_2fdev_2fttyS0",
++"goal": "start",
++"state": "running",
++"env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/sbin:/bin:NONE/sbin", "TERM=linux", "TTY=/dev/ttyS0"],
++"start_env": null,
++"stop_env": null,
++"stop_on": {
++"value": {
++"id": "0x808d228",
++"type": "match",
++"value": 0,
++"name": "runlevel",
++"env": ["[016]"],
++"event": null
++},
++"left": null,
++"right": null
++},
++"pid": [1707, 0, 0, 0, 0],
++"blocker": null,
++"blocking": [],
++"kill_timer": null,
++"kill_process": "-1",
++"failed": 0,
++"failed_process": "-1",
++"exit_status": 0,
++"respawn_time": 0,
++"respawn_count": 0,
++"trace_forks": 0,
++"trace_state": "none"
++}
++}
++},
++"messagebus": {
++"id": "0x8082150",
++"name": "messagebus",
++"path": "/com/ubuntu/Upstart/jobs/messagebus",
++"instance": "",
++"description": "The D-BUS systemwide message bus",
++"author": null,
++"version": null,
++"env": null,
++"export": null,
++"start_on": {
++"value": {
++"id": "0x8082fc0",
++"type": "match",
++"value": 0,
++"name": "pld.sysinit-done",
++"env": null,
++"event": null
++},
++"left": null,
++"right": null
++},
++"stop_on": {
++"value": {
++"id": "0x8083128",
++"type": "match",
++"value": 0,
++"name": "pld.shutdown-started",
++"env": null,
++"event": null
++},
++"left": null,
++"right": null
++},
++"emits": null,
++"process": [{
++"script": 0,
++"command": "/usr/bin/dbus-daemon --system --fork"
++}, {
++"script": 1,
++"command": "if modinfo capability >/dev/null 2>&1; then\n\tmodprobe -s capability\nfi\ndbus-uuidgen --ensure\n"
++}, null, null, {
++"script": 1,
++"command": "rm -f /var/run/dbus.pid || :\n"
++}],
++"expect": "fork",
++"task": 0,
++"kill_timeout": 5,
++"respawn": 1,
++"respawn_limit": 10,
++"respawn_interval": 5,
++"normalexit": null,
++"console": "none",
++"nice": 0,
++"oom_adj": 0,
++"limits": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
++"chroot": null,
++"chdir": null,
++"deleted": 0,
++"instances": {
++"": {
++"id": "0x808cdd8",
++"name": "",
++"class": "0x8082150",
++"path": "/com/ubuntu/Upstart/jobs/messagebus/_",
++"goal": "start",
++"state": "running",
++"env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/sbin:/bin:NONE/sbin", "TERM=linux", "UPSTART_EVENTS=pld.sysinit-done"],
++"start_env": null,
++"stop_env": null,
++"stop_on": {
++"value": {
++"id": "0x808b300",
++"type": "match",
++"value": 0,
++"name": "pld.shutdown-started",
++"env": null,
++"event": null
++},
++"left": null,
++"right": null
++},
++"pid": [1478, 0, 0, 0, 0],
++"blocker": null,
++"blocking": [],
++"kill_timer": null,
++"kill_process": "-1",
++"failed": 0,
++"failed_process": "-1",
++"exit_status": 0,
++"respawn_time": 0,
++"respawn_count": 0,
++"trace_forks": 1,
++"trace_state": "none"
++}
++}
++},
++"random": {
++"id": "0x80834a8",
++"name": "random",
++"path": "/com/ubuntu/Upstart/jobs/random",
++"instance": "",
++"description": "Save random entropy on shutdown and restore it at boot time",
++"author": null,
++"version": null,
++"env": ["SEED_FILE=/var/run/random-seed"],
++"export": null,
++"start_on": {
++"value": {
++"id": "0x8084248",
++"type": "match",
++"value": 0,
++"name": "pld.sysinit-done",
++"env": null,
++"event": null
++},
++"left": null,
++"right": null
++},
++"stop_on": {
++"value": {
++"id": "0x80843b0",
++"type": "match",
++"value": 0,
++"name": "pld.shutdown-started",
++"env": null,
++"event": null
++},
++"left": null,
++"right": null
++},
++"emits": null,
++"process": [null, {
++"script": 1,
++"command": "poolfile=/proc/sys/kernel/random/poolsize\n[ -r $poolfile ] && bytes=\"$(cat $poolfile)\" || bytes=512\nif [ -f $SEED_FILE ]; then\n\tcat $SEED_FILE >/dev/urandom\nelse\n\ttouch $SEED_FILE\nfi\nchmod 600 $SEED_FILE\ndd if=/dev/urandom of=$SEED_FILE count=1 bs=$bytes 2>/dev/null\n"
++}, null, null, {
++"script": 1,
++"command": "poolfile=/proc/sys/kernel/random/poolsize\n[ -r $poolfile ] && bytes=\"$(cat $poolfile)\" || bytes=512\ntouch $SEED_FILE\nchmod 600 $SEED_FILE\ndd if=/dev/urandom of=$SEED_FILE count=1 bs=$bytes 2>/dev/null\n"
++}],
++"expect": "none",
++"task": 0,
++"kill_timeout": 5,
++"respawn": 0,
++"respawn_limit": 10,
++"respawn_interval": 5,
++"normalexit": null,
++"console": "none",
++"nice": 0,
++"oom_adj": 0,
++"limits": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
++"chroot": null,
++"chdir": null,
++"deleted": 0,
++"instances": {
++"": {
++"id": "0x808d500",
++"name": "",
++"class": "0x80834a8",
++"path": "/com/ubuntu/Upstart/jobs/random/_",
++"goal": "start",
++"state": "running",
++"env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/sbin:/bin:NONE/sbin", "TERM=linux", "SEED_FILE=/var/run/random-seed", "UPSTART_EVENTS=pld.sysinit-done"],
++"start_env": null,
++"stop_env": null,
++"stop_on": {
++"value": {
++"id": "0x808d600",
++"type": "match",
++"value": 0,
++"name": "pld.shutdown-started",
++"env": null,
++"event": null
++},
++"left": null,
++"right": null
++},
++"pid": [0, 0, 0, 0, 0],
++"blocker": null,
++"blocking": [],
++"kill_timer": null,
++"kill_process": "-1",
++"failed": 0,
++"failed_process": "-1",
++"exit_status": 0,
++"respawn_time": 0,
++"respawn_count": 0,
++"trace_forks": 0,
++"trace_state": "none"
++}
++}
++},
++"control-alt-delete": {
++"id": "0x8081748",
++"name": "control-alt-delete",
++"path": "/com/ubuntu/Upstart/jobs/control_2dalt_2ddelete",
++"instance": "",
++"description": "emergency keypress handling",
++"author": "Scott James Remnant <scott@netsplit.com>",
++"version": null,
++"env": null,
++"export": null,
++"start_on": {
++"value": {
++"id": "0x8081d38",
++"type": "match",
++"value": 0,
++"name": "control-alt-delete",
++"env": null,
++"event": null
++},
++"left": null,
++"right": null
++},
++"stop_on": null,
++"emits": null,
++"process": [{
++"script": 0,
++"command": "shutdown -r now \"Control-Alt-Delete pressed\""
++}, null, null, null, null],
++"expect": "none",
++"task": 1,
++"kill_timeout": 5,
++"respawn": 0,
++"respawn_limit": 10,
++"respawn_interval": 5,
++"normalexit": null,
++"console": "none",
++"nice": 0,
++"oom_adj": 0,
++"limits": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
++"chroot": null,
++"chdir": null,
++"deleted": 0,
++"instances": {
++
++}
++},
++"rcS": {
++"id": "0x8084f10",
++"name": "rcS",
++"path": "/com/ubuntu/Upstart/jobs/rcS",
++"instance": "",
++"description": "rcS - runlevel compatibility This task runs the old sysv-rc startup scripts.",
++"author": null,
++"version": null,
++"env": null,
++"export": null,
++"start_on": {
++"value": {
++"id": "0x8085f30",
++"type": "match",
++"value": 0,
++"name": "startup",
++"env": null,
++"event": null
++},
++"left": null,
++"right": null
++},
++"stop_on": {
++"value": {
++"id": "0x8086020",
++"type": "match",
++"value": 0,
++"name": "runlevel",
++"env": null,
++"event": null
++},
++"left": null,
++"right": null
++},
++"emits": ["all-swaps", "filesystem", "local-filesystems", "root-filesystem", "virtual-filesystems", "runlevel"],
++"process": [{
++"script": 0,
++"command": "/etc/rc.d/rc.sysinit"
++}, null, null, null, {
++"script": 1,
++"command": "if [ \"$UPSTART_EVENTS\" = \"startup\" ]; then\n\trunlevel=$(/bin/awk -F ':' '$3 == \"initdefault\" && $1 !~ \"^#\" { print $2 }' /etc/inittab)\n\t[ -z \"$runlevel\" ] && runlevel=\"3\"\n\tfor t in $(cat /proc/cmdline); do\n\t\tcase $t in\n\t\t\t-s|single|S|s) runlevel=\"S\" ;;\n\t\t\t[1-9])       runlevel=\"$t\" ;;\n\t\tesac\n\tdone\n\texec telinit $runlevel\nfi\n"
++}],
++"expect": "none",
++"task": 1,
++"kill_timeout": 5,
++"respawn": 0,
++"respawn_limit": 10,
++"respawn_interval": 5,
++"normalexit": null,
++"console": "output",
++"nice": 0,
++"oom_adj": 0,
++"limits": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
++"chroot": null,
++"chdir": null,
++"deleted": 0,
++"instances": {
++
++}
++},
++"cherokee": {
++"id": "0x8080dc8",
++"name": "cherokee",
++"path": "/com/ubuntu/Upstart/jobs/cherokee",
++"instance": "",
++"description": null,
++"author": null,
++"version": null,
++"env": ["SERVICE=web-server"],
++"export": ["SERVICE"],
++"start_on": {
++"value": {
++"id": "0x8081308",
++"type": "and",
++"value": 0,
++"name": null,
++"env": null,
++"event": null
++},
++"left": {
++"value": {
++"id": "0x8081210",
++"type": "match",
++"value": 0,
++"name": "pld.network-started",
++"env": null,
++"event": null
++},
++"left": null,
++"right": null
++},
++"right": {
++"value": {
++"id": "0x80813b8",
++"type": "match",
++"value": 0,
++"name": "started",
++"env": ["random"],
++"event": null
++},
++"left": null,
++"right": null
++}
++},
++"stop_on": {
++"value": {
++"id": "0x8081580",
++"type": "match",
++"value": 0,
++"name": "pld.shutdown-started",
++"env": null,
++"event": null
++},
++"left": null,
++"right": null
++},
++"emits": null,
++"process": [{
++"script": 1,
++"command": "exec /usr/sbin/cherokee\n"
++}, null, null, null, null],
++"expect": "none",
++"task": 0,
++"kill_timeout": 5,
++"respawn": 1,
++"respawn_limit": 10,
++"respawn_interval": 5,
++"normalexit": null,
++"console": "output",
++"nice": 0,
++"oom_adj": 0,
++"limits": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
++"chroot": null,
++"chdir": null,
++"deleted": 0,
++"instances": {
++"": {
++"id": "0x808f190",
++"name": "",
++"class": "0x8080dc8",
++"path": "/com/ubuntu/Upstart/jobs/cherokee/_",
++"goal": "start",
++"state": "running",
++"env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/sbin:/bin:NONE/sbin", "TERM=linux", "SERVICE=web-server", "JOB=random", "INSTANCE=", "UPSTART_EVENTS=pld.network-started started"],
++"start_env": null,
++"stop_env": null,
++"stop_on": {
++"value": {
++"id": "0x808a048",
++"type": "match",
++"value": 0,
++"name": "pld.shutdown-started",
++"env": null,
++"event": null
++},
++"left": null,
++"right": null
++},
++"pid": [1622, 0, 0, 0, 0],
++"blocker": null,
++"blocking": [],
++"kill_timer": null,
++"kill_process": "-1",
++"failed": 0,
++"failed_process": "-1",
++"exit_status": 0,
++"respawn_time": 0,
++"respawn_count": 0,
++"trace_forks": 0,
++"trace_state": "none"
++}
++}
++},
++"crond": {
++"id": "0x80818e8",
++"name": "crond",
++"path": "/com/ubuntu/Upstart/jobs/crond",
++"instance": "",
++"description": "Cronie - the cron daemon",
++"author": null,
++"version": null,
++"env": ["CROND_SYSLOG_RESULT=no", "CROND_MAIL_PROG"],
++"export": null,
++"start_on": {
++"value": {
++"id": "0x80829e0",
++"type": "match",
++"value": 0,
++"name": "pld.sysinit-done",
++"env": null,
++"event": null
++},
++"left": null,
++"right": null
++},
++"stop_on": {
++"value": {
++"id": "0x8082b48",
++"type": "match",
++"value": 0,
++"name": "pld.shutdown-started",
++"env": null,
++"event": null
++},
++"left": null,
++"right": null
++},
++"emits": null,
++"process": [{
++"script": 1,
++"command": "\tCROND_ARGS=\"\"\n\t# Read the old-style service config\n\t[ -f /etc/sysconfig/cron ] && . /etc/sysconfig/cron\n\n\t# no 'is_yes' as we don't want the havy init.d/functions here\n\tif [ \"$CROND_SYSLOG_RESULT\" = \"yes\" ] ; then\n\t\tCROND_ARGS=\"$CROND_ARGS -s\"\n\tfi\n\n\tif [ -n \"$CROND_MAIL_PROG\" ]; then\n\t\t# XXX: should we handle spaces in $CROND_MAIL_PROG?\n\t\tCROND_ARGS=\"$CROND_ARGS -m $CROND_MAIL_PROG\"\n\tfi\n\n\texec /usr/sbin/crond -n $CROND_ARGS\n"
++}, null, null, null, null],
++"expect": "none",
++"task": 0,
++"kill_timeout": 5,
++"respawn": 1,
++"respawn_limit": 10,
++"respawn_interval": 5,
++"normalexit": null,
++"console": "none",
++"nice": 0,
++"oom_adj": 0,
++"limits": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
++"chroot": null,
++"chdir": null,
++"deleted": 0,
++"instances": {
++"": {
++"id": "0x808dc40",
++"name": "",
++"class": "0x80818e8",
++"path": "/com/ubuntu/Upstart/jobs/crond/_",
++"goal": "start",
++"state": "running",
++"env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/sbin:/bin:NONE/sbin", "TERM=linux", "CROND_SYSLOG_RESULT=no", "UPSTART_EVENTS=pld.sysinit-done"],
++"start_env": null,
++"stop_env": null,
++"stop_on": {
++"value": {
++"id": "0x808dd40",
++"type": "match",
++"value": 0,
++"name": "pld.shutdown-started",
++"env": null,
++"event": null
++},
++"left": null,
++"right": null
++},
++"pid": [1462, 0, 0, 0, 0],
++"blocker": null,
++"blocking": [],
++"kill_timer": null,
++"kill_process": "-1",
++"failed": 0,
++"failed_process": "-1",
++"exit_status": 0,
++"respawn_time": 0,
++"respawn_count": 0,
++"trace_forks": 0,
++"trace_state": "none"
++}
++}
++},
++"syslog-ng": {
++"id": "0x80875f0",
++"name": "syslog-ng",
++"path": "/com/ubuntu/Upstart/jobs/syslog_2dng",
++"instance": "",
++"description": null,
++"author": null,
++"version": null,
++"env": ["SERVICE=syslog"],
++"export": ["SERVICE"],
++"start_on": {
++"value": {
++"id": "0x8087950",
++"type": "match",
++"value": 0,
++"name": "pld.sysinit-done",
++"env": null,
++"event": null
++},
++"left": null,
++"right": null
++},
++"stop_on": {
++"value": {
++"id": "0x8087ab8",
++"type": "match",
++"value": 0,
++"name": "pld.shutdown-started",
++"env": null,
++"event": null
++},
++"left": null,
++"right": null
++},
++"emits": null,
++"process": [{
++"script": 0,
++"command": "/usr/sbin/syslog-ng --process-mode=background -f /etc/syslog-ng/syslog-ng.conf"
++}, null, null, null, null],
++"expect": "fork",
++"task": 0,
++"kill_timeout": 5,
++"respawn": 1,
++"respawn_limit": 10,
++"respawn_interval": 5,
++"normalexit": null,
++"console": "output",
++"nice": 0,
++"oom_adj": 0,
++"limits": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
++"chroot": null,
++"chdir": null,
++"deleted": 0,
++"instances": {
++"": {
++"id": "0x808e350",
++"name": "",
++"class": "0x80875f0",
++"path": "/com/ubuntu/Upstart/jobs/syslog_2dng/_",
++"goal": "start",
++"state": "running",
++"env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/sbin:/bin:NONE/sbin", "TERM=linux", "SERVICE=syslog", "UPSTART_EVENTS=pld.sysinit-done"],
++"start_env": null,
++"stop_env": null,
++"stop_on": {
++"value": {
++"id": "0x808e2d0",
++"type": "match",
++"value": 0,
++"name": "pld.shutdown-started",
++"env": null,
++"event": null
++},
++"left": null,
++"right": null
++},
++"pid": [1476, 0, 0, 0, 0],
++"blocker": null,
++"blocking": [],
++"kill_timer": null,
++"kill_process": "-1",
++"failed": 0,
++"failed_process": "-1",
++"exit_status": 0,
++"respawn_time": 0,
++"respawn_count": 0,
++"trace_forks": 1,
++"trace_state": "none"
++}
++}
++},
++"start-ttys": {
++"id": "0x80865f8",
++"name": "start-ttys",
++"path": "/com/ubuntu/Upstart/jobs/start_2dttys",
++"instance": "",
++"description": null,
++"author": null,
++"version": null,
++"env": ["ACTIVE_CONSOLES=/dev/tty[1-6]", "X_TTY=/dev/tty5"],
++"export": null,
++"start_on": {
++"value": {
++"id": "0x80871f0",
++"type": "match",
++"value": 0,
++"name": "stopped",
++"env": ["rc", "RUNLEVEL=[2345]"],
++"event": null
++},
++"left": null,
++"right": null
++},
++"stop_on": null,
++"emits": null,
++"process": [{
++"script": 1,
++"command": "if [ -f /etc/sysconfig/upstart ]; then\n\t. /etc/sysconfig/upstart\nfi\nfor tty in $(echo $ACTIVE_CONSOLES) ; do\n\t[ \"$RUNLEVEL\" = \"5\" -a \"$tty\" = \"$X_TTY\" ] && continue\n\tinitctl start tty TTY=$tty\ndone\n"
++}, null, null, null, null],
++"expect": "none",
++"task": 1,
++"kill_timeout": 5,
++"respawn": 0,
++"respawn_limit": 10,
++"respawn_interval": 5,
++"normalexit": null,
++"console": "none",
++"nice": 0,
++"oom_adj": 0,
++"limits": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
++"chroot": null,
++"chdir": null,
++"deleted": 0,
++"instances": {
++
++}
++},
++"test3": {
++"id": "0x8088a98",
++"name": "test3",
++"path": "/com/ubuntu/Upstart/jobs/test3",
++"instance": "",
++"description": "test",
++"author": null,
++"version": null,
++"env": null,
++"export": null,
++"start_on": null,
++"stop_on": null,
++"emits": null,
++"process": [{
++"script": 1,
++"command": "exec python -c 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(1000)'\n"
++}, null, null, null, null],
++"expect": "none",
++"task": 0,
++"kill_timeout": 5,
++"respawn": 1,
++"respawn_limit": 10,
++"respawn_interval": 5,
++"normalexit": [0, 1, 2, 3],
++"console": "none",
++"nice": 0,
++"oom_adj": 0,
++"limits": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
++"chroot": null,
++"chdir": null,
++"deleted": 0,
++"instances": {
++
++}
++},
++"ntpd": {
++"id": "0x8081fd0",
++"name": "ntpd",
++"path": "/com/ubuntu/Upstart/jobs/ntpd",
++"instance": "",
++"description": "NTP daemon",
++"author": null,
++"version": null,
++"env": ["NTPD_USER=ntp", "NTPD_OPTIONS="],
++"export": null,
++"start_on": {
++"value": {
++"id": "0x8083848",
++"type": "match",
++"value": 0,
++"name": "pld.network-started",
++"env": null,
++"event": null
++},
++"left": null,
++"right": null
++},
++"stop_on": {
++"value": {
++"id": "0x80839b0",
++"type": "match",
++"value": 0,
++"name": "pld.shutdown-started",
++"env": null,
++"event": null
++},
++"left": null,
++"right": null
++},
++"emits": null,
++"process": [{
++"script": 1,
++"command": "# Source old-style ntp service configuration\n[ -f /etc/sysconfig/ntpd ] && . /etc/sysconfig/ntpd\n\t\nexec /usr/sbin/ntpd -n -c /etc/ntp/ntp.conf -p /var/run/ntpd.pid ${NTPD_USER:+-u $NTPD_USER} $NTPD_OPTIONS\n"
++}, {
++"script": 1,
++"command": "# do not bother to start if not configured\n[ -f /etc/ntp/ntp.conf ] || /sbin/initctl stop\n"
++}, null, null, null],
++"expect": "none",
++"task": 0,
++"kill_timeout": 5,
++"respawn": 1,
++"respawn_limit": 10,
++"respawn_interval": 5,
++"normalexit": null,
++"console": "none",
++"nice": 0,
++"oom_adj": 0,
++"limits": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
++"chroot": null,
++"chdir": null,
++"deleted": 0,
++"instances": {
++"": {
++"id": "0x808f950",
++"name": "",
++"class": "0x8081fd0",
++"path": "/com/ubuntu/Upstart/jobs/ntpd/_",
++"goal": "start",
++"state": "running",
++"env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/sbin:/bin:NONE/sbin", "TERM=linux", "NTPD_USER=ntp", "NTPD_OPTIONS=", "UPSTART_EVENTS=pld.network-started"],
++"start_env": null,
++"stop_env": null,
++"stop_on": {
++"value": {
++"id": "0x808fa50",
++"type": "match",
++"value": 0,
++"name": "pld.shutdown-started",
++"env": null,
++"event": null
++},
++"left": null,
++"right": null
++},
++"pid": [1774, 0, 0, 0, 0],
++"blocker": null,
++"blocking": [],
++"kill_timer": null,
++"kill_process": "-1",
++"failed": 0,
++"failed_process": "-1",
++"exit_status": 0,
++"respawn_time": 2632,
++"respawn_count": 1,
++"trace_forks": 0,
++"trace_state": "none"
++}
++}
++},
++"rcS-sulogin": {
++"id": "0x8085068",
++"name": "rcS-sulogin",
++"path": "/com/ubuntu/Upstart/jobs/rcS_2dsulogin",
++"instance": "",
++"description": "rcS-sulogin - 'single-user' runlevel compatibility This task runs /bin/sh during 'single-user' mode, then continues to the default runlevel.",
++"author": null,
++"version": null,
++"env": null,
++"export": null,
++"start_on": {
++"value": {
++"id": "0x8085458",
++"type": "match",
++"value": 0,
++"name": "runlevel",
++"env": ["S"],
++"event": null
++},
++"left": null,
++"right": null
++},
++"stop_on": {
++"value": {
++"id": "0x80855c8",
++"type": "match",
++"value": 0,
++"name": "runlevel",
++"env": ["[!S]"],
++"event": null
++},
++"left": null,
++"right": null
++},
++"emits": ["runlevel"],
++"process": [{
++"script": 1,
++"command": "exec /bin/sh\n"
++}, null, null, null, {
++"script": 1,
++"command": "if [ \"$RUNLEVEL\" = \"S\" ]; then\n\trunlevel=$(/bin/awk -F ':' '$3 == \"initdefault\" && $1 !~ \"^#\" { print $2 }' /etc/inittab)\n\t[ -z \"$runlevel\" ] && runlevel=\"3\"\n\texec telinit $runlevel\nfi\n"
++}],
++"expect": "none",
++"task": 0,
++"kill_timeout": 5,
++"respawn": 0,
++"respawn_limit": 10,
++"respawn_interval": 5,
++"normalexit": null,
++"console": "owner",
++"nice": 0,
++"oom_adj": 0,
++"limits": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
++"chroot": null,
++"chdir": null,
++"deleted": 0,
++"instances": {
++
++}
++},
++"test2": {
++"id": "0x8088180",
++"name": "test2",
++"path": "/com/ubuntu/Upstart/jobs/test2",
++"instance": "",
++"description": "test",
++"author": null,
++"version": null,
++"env": null,
++"export": null,
++"start_on": {
++"value": {
++"id": "0x8088800",
++"type": "and",
++"value": 0,
++"name": null,
++"env": null,
++"event": null
++},
++"left": {
++"value": {
++"id": "0x80886a8",
++"type": "match",
++"value": 0,
++"name": "started",
++"env": ["test3"],
++"event": null
++},
++"left": null,
++"right": null
++},
++"right": {
++"value": {
++"id": "0x8088888",
++"type": "match",
++"value": 1,
++"name": "starting",
++"env": ["test"],
++"event": "0x80903f0"
++},
++"left": null,
++"right": null
++}
++},
++"stop_on": null,
++"emits": null,
++"process": [{
++"script": 1,
++"command": "exec python -c 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(1000)'\n"
++}, null, null, null, null],
++"expect": "none",
++"task": 0,
++"kill_timeout": 5,
++"respawn": 1,
++"respawn_limit": 10,
++"respawn_interval": 5,
++"normalexit": [0, 1, 2, 3],
++"console": "none",
++"nice": 0,
++"oom_adj": 0,
++"limits": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
++"chroot": null,
++"chdir": null,
++"deleted": 0,
++"instances": {
++
++}
++}
++}}
+
+=== added file 'init/tests/test_save_state.c'
+--- init/tests/test_save_state.c	1970-01-01 00:00:00 +0000
++++ init/tests/test_save_state.c	2010-06-08 13:33:50 +0000
+@@ -0,0 +1,154 @@
++/* upstart
++ *
++ * test_save_state.c - test suite for init/save_state.c
++ *
++ * Copyright © 2010
++ * Author: Jacek Konieczny <jajcus@jajcus.net>.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2, as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++ */
++
++#include <limits.h>
++
++#include <nih/string.h>
++#include <nih/test.h>
++#include <nih/error.h>
++
++#include "save_state.h"
++#include "event.h"
++#include "job.h"
++#include "conf.h"
++#include "control.h"
++
++
++void
++test_dump_state(void)
++{
++	FILE *f;
++	char dirname[PATH_MAX];
++	char filename[PATH_MAX];
++	int rc;
++	char **env;
++	ConfSource *source1, *source2;
++	ConfFile *file1, *file2, *file3;
++	JobClass *class1, *class2, *class3;
++	Job *job1, *job2, *job3;
++	Event *event1, *event2, *event3;
++	NihError *err;
++
++	TEST_FUNCTION("dump_state");
++
++	TEST_FILENAME(dirname);
++	mkdir(dirname, 0755);
++
++	TEST_FEATURE("saving uninitialized state");
++	strcpy(filename, dirname);
++	strcat(filename, "/state1");
++	f = fopen(filename, "w");
++	rc = dump_state(f);
++	TEST_EQ(rc, 0);
++	fclose(f);
++	unlink(filename);
++
++	job_class_init();
++	event_init();
++
++	TEST_FEATURE("saving empty state");
++	strcpy(filename, dirname);
++	strcat(filename, "/state2");
++	f = fopen(filename, "w");
++	rc = dump_state(f);
++	TEST_EQ(rc, 0);
++	fclose(f);
++	unlink(filename);
++
++	source1 = conf_source_new(NULL, "/tmp/foo", CONF_DIR);
++	source2 = conf_source_new(NULL, "/tmp/bar", CONF_JOB_DIR);
++	file1 = conf_file_new(source2, "/tmp/foot/one.conf");
++	class1 = file1->job = job_class_new(NULL, "one");
++	file2 = conf_file_new(source2, "/tmp/foot/two.conf");
++	class2 = file2->job = job_class_new(NULL, "two");
++	file3 = conf_file_new(source2, "/tmp/foot/three.conf");
++	class3 = file3->job = job_class_new(NULL, "three");
++	job_class_consider(class1);
++	job_class_consider(class2);
++	job_class_consider(class3);
++	job1 = job_new(class1, "");
++	job2 = job_new(class1, "two");
++	job3 = job_new(class2, "three");
++	TEST_ALLOC_SAFE {
++		env = nih_str_array_new(NULL);
++		NIH_MUST(nih_str_array_add(&env, NULL, NULL, "FOO=BAR"));
++		NIH_MUST(nih_str_array_add(&env, NULL, NULL, "BAR=FRODO"));
++	}
++	event1 = event_new(NULL, "one", env);
++	event2 = event_new(NULL, "two", env);
++	event3 = event_new(NULL, "three", env);
++	nih_discard(env);
++
++	TEST_FEATURE("saving state with jobs and events");
++	strcpy(filename, dirname);
++	strcat(filename, "/state3");
++	f = fopen(filename, "w");
++	rc = dump_state(f);
++	TEST_EQ(rc, 0);
++	fclose(f);
++	unlink(filename);
++
++	TEST_FEATURE("I/O error handling");
++	strcpy(filename, dirname);
++	strcat(filename, "/state3");
++	f = fopen(filename, "w");
++	setvbuf(f, NULL, _IONBF, 0);	/* make sure buferring won't break the test */
++	close(fileno(f));	/* close the file to generate I/O error */
++	errno = 0;
++	rc = dump_state(f);
++	TEST_EQ(rc, -1);
++	err = nih_error_get();
++	TEST_EQ(err->number, EBADF);
++	nih_free(err);
++	fclose(f);
++	unlink(filename);
++
++#ifdef HAVE_FMEMOPEN
++	TEST_FEATURE("EOF handling");
++	char buffer[100];	/* buffer for only 100 characters */
++	f = fmemopen(buffer, 100, "w");
++	setvbuf(f, NULL, _IONBF, 0);	/* make sure buferring won't break the test */
++	errno = 0;
++	rc = dump_state(f);
++	TEST_EQ(rc, -1);
++	err = nih_error_get();
++	TEST_EQ(err->number, EIO);
++	nih_free(err);
++	fclose(f);
++#endif
++
++	nih_free(event3);
++	nih_free(event2);
++	nih_free(event1);
++	nih_free(source2);
++	nih_free(source1);
++
++	rmdir(dirname);
++}
++
++
++int
++main(int argc, char *argv[])
++{
++
++	test_dump_state();
++	return 0;
++}
+
+=== added file 'init/tests/test_state_parser.c'
+--- init/tests/test_state_parser.c	1970-01-01 00:00:00 +0000
++++ init/tests/test_state_parser.c	2010-06-08 13:33:50 +0000
+@@ -0,0 +1,504 @@
++/* upstart
++ *
++ * test_state_parser.c - test suite for init/state_{lexer,parser}.c
++ *
++ * Copyright © 2010
++ * Author: Jacek Konieczny <jajcus@jajcus.net>.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2, as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License along
++ * with this program; if not, write to the Free Software Foundation, Inc.,
++ * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++ */
++
++#include "load_state.h"
++
++#include <limits.h>
++#include <nih/test.h>
++#include <nih/error.h>
++#include "errors.h"
++
++
++void
++test_parse_state(void)
++{
++	FILE *f;
++	char filename[PATH_MAX];
++	ParsedStateValue *state, *value, *value1;
++	int count;
++	NihError *error;
++
++	nih_error_init ();
++	TEST_FUNCTION("parse_state");
++
++	TEST_FEATURE("parsing empty object");
++	TEST_FILENAME(filename);
++	f = fopen(filename, "w");
++	fprintf(f, "{}");
++	fclose(f);
++	TEST_ALLOC_FAIL {
++		f = fopen(filename, "r");
++		state = parse_state(f);
++		fclose(f);
++		if (test_alloc_failed) {
++			TEST_EQ_P(state, NULL);
++			NihError *err;
++			err = nih_error_get();
++			TEST_EQ(err->number, ENOMEM);
++			nih_free(err);
++			continue;
++		}
++		TEST_NE_P(state, NULL);
++		TEST_ALLOC_SIZE(state, sizeof(ParsedStateValue));
++		TEST_EQ(state->type, VAL_HASH);
++		TEST_ALLOC_SIZE(state->hash, sizeof(NihHash));
++		count = 0;
++		NIH_HASH_FOREACH(state->hash, iter) count++;
++		TEST_EQ(count, 0);
++		nih_free(state);
++	}
++	unlink(filename);
++
++	TEST_FEATURE("parsing error");
++	TEST_FILENAME(filename);
++	f = fopen(filename, "w");
++	fprintf(f, "{bad JSON}");
++	fclose(f);
++	f = fopen(filename, "r");
++	state = parse_state(f);
++	fclose(f);
++	TEST_EQ_P(state, NULL);
++	error = nih_error_get ();
++	TEST_EQ (error->number, STATE_PARSE_ERROR);
++	nih_free(error);
++	unlink(filename);
++
++	TEST_FEATURE("parsing single null field");
++	TEST_FILENAME(filename);
++	f = fopen(filename, "w");
++	fprintf(f, "{\"test\": null}");
++	fclose(f);
++	TEST_ALLOC_FAIL {
++		f = fopen(filename, "r");
++		state = parse_state(f);
++		fclose(f);
++		if (test_alloc_failed) {
++			TEST_EQ_P(state, NULL);
++			NihError *err;
++			err = nih_error_get();
++			TEST_EQ(err->number, ENOMEM);
++			nih_free(err);
++			continue;
++		}
++		TEST_NE_P(state, NULL);
++		count = 0;
++		NIH_HASH_FOREACH(state->hash, iter) count++;
++		TEST_EQ(count, 1);
++		value =
++		    (ParsedStateValue *) nih_hash_lookup(state->hash,
++							 "test");
++		TEST_EQ(value->type, VAL_NULL);
++		nih_free(state);
++	}
++	unlink(filename);
++
++	TEST_FEATURE("parsing single integer field");
++	TEST_FILENAME(filename);
++	f = fopen(filename, "w");
++	fprintf(f, "{\"test\": 42}");
++	fclose(f);
++	TEST_ALLOC_FAIL {
++		f = fopen(filename, "r");
++		state = parse_state(f);
++		fclose(f);
++		if (test_alloc_failed) {
++			TEST_EQ_P(state, NULL);
++			NihError *err;
++			err = nih_error_get();
++			TEST_EQ(err->number, ENOMEM);
++			nih_free(err);
++			continue;
++		}
++		TEST_NE_P(state, NULL);
++		count = 0;
++		NIH_HASH_FOREACH(state->hash, iter) count++;
++		TEST_EQ(count, 1);
++		value =
++		    (ParsedStateValue *) nih_hash_lookup(state->hash,
++							 "test");
++		TEST_EQ(value->type, VAL_INTEGER);
++		TEST_EQ(value->integer, 42);
++		nih_free(state);
++	}
++	unlink(filename);
++
++	TEST_FEATURE("parsing single negative integer field");
++	TEST_FILENAME(filename);
++	f = fopen(filename, "w");
++	fprintf(f, "{\"test\": -42}");
++	fclose(f);
++	TEST_ALLOC_FAIL {
++		f = fopen(filename, "r");
++		state = parse_state(f);
++		fclose(f);
++		if (test_alloc_failed) {
++			TEST_EQ_P(state, NULL);
++			NihError *err;
++			err = nih_error_get();
++			TEST_EQ(err->number, ENOMEM);
++			nih_free(err);
++			continue;
++		}
++		TEST_NE_P(state, NULL);
++		count = 0;
++		NIH_HASH_FOREACH(state->hash, iter) count++;
++		TEST_EQ(count, 1);
++		value =
++		    (ParsedStateValue *) nih_hash_lookup(state->hash,
++							 "test");
++		TEST_EQ(value->type, VAL_INTEGER);
++		TEST_EQ(value->integer, -42);
++		nih_free(state);
++	}
++	unlink(filename);
++
++	TEST_FEATURE("parsing single true field");
++	TEST_FILENAME(filename);
++	f = fopen(filename, "w");
++	fprintf(f, "{\"test\": true}");
++	fclose(f);
++	TEST_ALLOC_FAIL {
++		f = fopen(filename, "r");
++		state = parse_state(f);
++		fclose(f);
++		if (test_alloc_failed) {
++			TEST_EQ_P(state, NULL);
++			NihError *err;
++			err = nih_error_get();
++			TEST_EQ(err->number, ENOMEM);
++			nih_free(err);
++			continue;
++		}
++		TEST_NE_P(state, NULL);
++		count = 0;
++		NIH_HASH_FOREACH(state->hash, iter) count++;
++		TEST_EQ(count, 1);
++		value =
++		    (ParsedStateValue *) nih_hash_lookup(state->hash,
++							 "test");
++		TEST_EQ(value->type, VAL_INTEGER);
++		TEST_TRUE(value->integer);
++		nih_free(state);
++	}
++	unlink(filename);
++
++	TEST_FEATURE("parsing single false field");
++	TEST_FILENAME(filename);
++	f = fopen(filename, "w");
++	fprintf(f, "{\"test\": false}");
++	fclose(f);
++	TEST_ALLOC_FAIL {
++		f = fopen(filename, "r");
++		state = parse_state(f);
++		fclose(f);
++		if (test_alloc_failed) {
++			TEST_EQ_P(state, NULL);
++			NihError *err;
++			err = nih_error_get();
++			TEST_EQ(err->number, ENOMEM);
++			nih_free(err);
++			continue;
++		}
++		TEST_NE_P(state, NULL);
++		count = 0;
++		NIH_HASH_FOREACH(state->hash, iter) count++;
++		TEST_EQ(count, 1);
++		value =
++		    (ParsedStateValue *) nih_hash_lookup(state->hash,
++							 "test");
++		TEST_EQ(value->type, VAL_INTEGER);
++		TEST_FALSE(value->integer);
++		nih_free(state);
++	}
++	unlink(filename);
++
++	TEST_FEATURE("parsing single string field");
++	TEST_FILENAME(filename);
++	f = fopen(filename, "w");
++	fprintf(f, "{\"test2\": \"something\"}");
++	fclose(f);
++	TEST_ALLOC_FAIL {
++		f = fopen(filename, "r");
++		state = parse_state(f);
++		fclose(f);
++		if (test_alloc_failed) {
++			TEST_EQ_P(state, NULL);
++			NihError *err;
++			err = nih_error_get();
++			TEST_EQ(err->number, ENOMEM);
++			nih_free(err);
++			continue;
++		}
++		TEST_NE_P(state, NULL);
++		count = 0;
++		NIH_HASH_FOREACH(state->hash, iter) count++;
++		TEST_EQ(count, 1);
++		value =
++		    (ParsedStateValue *) nih_hash_lookup(state->hash,
++							 "test2");
++		TEST_EQ(value->type, VAL_STRING);
++		TEST_EQ_STR(value->string, "something");
++		nih_free(state);
++	}
++	unlink(filename);
++
++	TEST_FEATURE("parsing empty string field");
++	TEST_FILENAME(filename);
++	f = fopen(filename, "w");
++	fprintf(f, "{\"test2\": \"\"}");
++	fclose(f);
++	TEST_ALLOC_FAIL {
++		f = fopen(filename, "r");
++		state = parse_state(f);
++		fclose(f);
++		if (test_alloc_failed) {
++			TEST_EQ_P(state, NULL);
++			NihError *err;
++			err = nih_error_get();
++			TEST_EQ(err->number, ENOMEM);
++			nih_free(err);
++			continue;
++		}
++		TEST_NE_P(state, NULL);
++		count = 0;
++		NIH_HASH_FOREACH(state->hash, iter) count++;
++		TEST_EQ(count, 1);
++		value =
++		    (ParsedStateValue *) nih_hash_lookup(state->hash,
++							 "test2");
++		TEST_EQ(value->type, VAL_STRING);
++		TEST_EQ_STR(value->string, "");
++		nih_free(state);
++	}
++	unlink(filename);
++
++	TEST_FEATURE("parsing string field with special characters");
++	TEST_FILENAME(filename);
++	f = fopen(filename, "w");
++	fprintf(f,
++		"{\"test2\": \"some\\u0001thing\\r\\nfoo\\t\\f\\\"\\\\\"}");
++	fclose(f);
++	TEST_ALLOC_FAIL {
++		f = fopen(filename, "r");
++		state = parse_state(f);
++		fclose(f);
++		if (test_alloc_failed) {
++			TEST_EQ_P(state, NULL);
++			NihError *err;
++			err = nih_error_get();
++			TEST_EQ(err->number, ENOMEM);
++			nih_free(err);
++			continue;
++		}
++		TEST_NE_P(state, NULL);
++		count = 0;
++		NIH_HASH_FOREACH(state->hash, iter) count++;
++		TEST_EQ(count, 1);
++		value =
++		    (ParsedStateValue *) nih_hash_lookup(state->hash,
++							 "test2");
++		TEST_EQ(value->type, VAL_STRING);
++		TEST_EQ_STR(value->string, "some\001thing\r\nfoo\t\f\"\\");
++		nih_free(state);
++	}
++	unlink(filename);
++
++
++	TEST_FEATURE("parsing multiple simple fields");
++	TEST_FILENAME(filename);
++	f = fopen(filename, "w");
++	fprintf(f,
++		"{\"test1\": null, \"test2\": \"something\", \"test3\": 42}");
++	fclose(f);
++	TEST_ALLOC_FAIL {
++		f = fopen(filename, "r");
++		state = parse_state(f);
++		fclose(f);
++		if (test_alloc_failed) {
++			TEST_EQ_P(state, NULL);
++			NihError *err;
++			err = nih_error_get();
++			TEST_EQ(err->number, ENOMEM);
++			nih_free(err);
++			continue;
++		}
++		TEST_NE_P(state, NULL);
++		count = 0;
++		NIH_HASH_FOREACH(state->hash, iter) count++;
++		TEST_EQ(count, 3);
++		value =
++		    (ParsedStateValue *) nih_hash_lookup(state->hash,
++							 "test1");
++		TEST_EQ(value->type, VAL_NULL);
++		value =
++		    (ParsedStateValue *) nih_hash_lookup(state->hash,
++							 "test2");
++		TEST_EQ(value->type, VAL_STRING);
++		TEST_EQ_STR(value->string, "something");
++		value =
++		    (ParsedStateValue *) nih_hash_lookup(state->hash,
++							 "test3");
++		TEST_EQ(value->type, VAL_INTEGER);
++		TEST_EQ(value->integer, 42);
++		nih_free(state);
++	}
++	unlink(filename);
++
++	TEST_FEATURE("parsing empty list");
++	TEST_FILENAME(filename);
++	f = fopen(filename, "w");
++	fprintf(f, "{\"test\": []}");
++	fclose(f);
++	TEST_ALLOC_FAIL {
++		f = fopen(filename, "r");
++		state = parse_state(f);
++		fclose(f);
++		if (test_alloc_failed) {
++			TEST_EQ_P(state, NULL);
++			NihError *err;
++			err = nih_error_get();
++			TEST_EQ(err->number, ENOMEM);
++			nih_free(err);
++			continue;
++		}
++		TEST_NE_P(state, NULL);
++		value =
++		    (ParsedStateValue *) nih_hash_lookup(state->hash,
++							 "test");
++		TEST_EQ(value->type, VAL_LIST);
++		count = 0;
++		NIH_LIST_FOREACH(value->list, iter) count++;
++		TEST_EQ(count, 0);
++		nih_free(state);
++	}
++	unlink(filename);
++
++	TEST_FEATURE("parsing single-element list");
++	TEST_FILENAME(filename);
++	f = fopen(filename, "w");
++	fprintf(f, "{\"test\": [\"one\"]}");
++	fclose(f);
++	TEST_ALLOC_FAIL {
++		f = fopen(filename, "r");
++		state = parse_state(f);
++		fclose(f);
++		if (test_alloc_failed) {
++			TEST_EQ_P(state, NULL);
++			NihError *err;
++			err = nih_error_get();
++			TEST_EQ(err->number, ENOMEM);
++			nih_free(err);
++			continue;
++		}
++		TEST_NE_P(state, NULL);
++		value =
++		    (ParsedStateValue *) nih_hash_lookup(state->hash,
++							 "test");
++		TEST_EQ(value->type, VAL_LIST);
++		count = 0;
++		NIH_LIST_FOREACH(value->list, iter) count++;
++		TEST_EQ(count, 1);
++		value1 = (ParsedStateValue *) value->list->next;
++		TEST_EQ(value1->type, VAL_STRING);
++		TEST_EQ_STR(value1->string, "one");
++		nih_free(state);
++	}
++	unlink(filename);
++
++	TEST_FEATURE("parsing multi-element list");
++	TEST_FILENAME(filename);
++	f = fopen(filename, "w");
++	fprintf(f, "{\"test\": [\"one\", 2, null]}");
++	fclose(f);
++	TEST_ALLOC_FAIL {
++		f = fopen(filename, "r");
++		state = parse_state(f);
++		fclose(f);
++		if (test_alloc_failed) {
++			TEST_EQ_P(state, NULL);
++			NihError *err;
++			err = nih_error_get();
++			TEST_EQ(err->number, ENOMEM);
++			nih_free(err);
++			continue;
++		}
++		TEST_NE_P(state, NULL);
++		value =
++		    (ParsedStateValue *) nih_hash_lookup(state->hash,
++							 "test");
++		TEST_EQ(value->type, VAL_LIST);
++		count = 0;
++		NIH_LIST_FOREACH(value->list, iter) count++;
++		TEST_EQ(count, 3);
++		value1 = (ParsedStateValue *) value->list->next;
++		TEST_EQ(value1->type, VAL_STRING);
++		TEST_EQ_STR(value1->string, "one");
++		value1 = (ParsedStateValue *) value1->entry.next;
++		TEST_EQ(value1->type, VAL_INTEGER);
++		TEST_EQ(value1->integer, 2);
++		value1 = (ParsedStateValue *) value1->entry.next;
++		TEST_EQ(value1->type, VAL_NULL);
++		nih_free(state);
++	}
++	unlink(filename);
++
++	TEST_FEATURE("parsing object field");
++	TEST_FILENAME(filename);
++	f = fopen(filename, "w");
++	fprintf(f, "{\"test\": {\"1\": \"one\", \"2\": null}}");
++	fclose(f);
++	TEST_ALLOC_FAIL {
++		f = fopen(filename, "r");
++		state = parse_state(f);
++		fclose(f);
++		if (test_alloc_failed) {
++			TEST_EQ_P(state, NULL);
++			NihError *err;
++			err = nih_error_get();
++			TEST_EQ(err->number, ENOMEM);
++			nih_free(err);
++			continue;
++		}
++		value =
++		    (ParsedStateValue *) nih_hash_lookup(state->hash,
++							 "test");
++		TEST_EQ(value->type, VAL_HASH);
++		count = 0;
++		NIH_HASH_FOREACH(value->hash, iter) count++;
++		TEST_EQ(count, 2);
++		value1 =
++		    (ParsedStateValue *) nih_hash_lookup(value->hash, "1");
++		TEST_EQ(value1->type, VAL_STRING);
++		TEST_EQ_STR(value1->string, "one");
++		value1 =
++		    (ParsedStateValue *) nih_hash_lookup(value->hash, "2");
++		TEST_EQ(value1->type, VAL_NULL);
++		nih_free(state);
++	}
++	unlink(filename);
++}
++
++int
++main(int argc, char *argv[])
++{
++	test_parse_state();
++	return 0;
++}
+
