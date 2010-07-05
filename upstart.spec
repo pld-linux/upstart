@@ -6,6 +6,7 @@
 %bcond_with	tests		# don't perform "make check"
 
 Summary:	Event-based init daemon
+Summary(hu.UTF-8):	Esemény-vezérelt init démon
 Summary(pl.UTF-8):	Oparty na zdarzeniach demon init
 Name:		upstart
 Version:	0.6.6
@@ -48,6 +49,11 @@ BuildRoot:	%{tmpdir}/%{name}-%{version}-root-%(id -u -n)
 upstart is a replacement for the /sbin/init daemon which handles
 starting of tasks and services during boot, stopping them during
 shutdown and supervising them while the system is running.
+
+%description  -l hu.UTF-8
+upstart az /sbin/init helyére pályázik. Az upstart kezelni tudja
+feladatok és szolgáltatások indítását boot-kor, leállítását a gép
+leállításakor és menedzselni, amíg a rendszer fut.
 
 %description -l pl.UTF-8
 upstart jest zamiennikiem demona /sbin/init zajmującym się
