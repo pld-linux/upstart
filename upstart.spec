@@ -9,12 +9,12 @@ Summary:	Event-based init daemon
 Summary(hu.UTF-8):	Esemény-vezérelt init démon
 Summary(pl.UTF-8):	Oparty na zdarzeniach demon init
 Name:		upstart
-Version:	0.6.6
-Release:	3
+Version:	0.6.7
+Release:	1
 License:	GPL v2
 Group:		Base
 Source0:	http://upstart.ubuntu.com/download/0.6/%{name}-%{version}.tar.gz
-# Source0-md5:	5a2e9962a4cea719fbe07c33e2591b06
+# Source0-md5:	37740f81b6d12a53072603fadee451c9
 URL:		http://upstart.ubuntu.com/
 Patch0:		pldize.patch
 # https://code.launchpad.net/~jajcus-jajcus/upstart/state-save-stable/+merge/27053/+preview-diff/+files/preview.diff
