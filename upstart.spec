@@ -10,7 +10,7 @@ Summary(hu.UTF-8):	Esemény-vezérelt init démon
 Summary(pl.UTF-8):	Oparty na zdarzeniach demon init
 Name:		upstart
 Version:	1.0
-Release:	1
+Release:	2
 Epoch:		1
 License:	GPL v2
 Group:		Base
