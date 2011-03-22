@@ -9,12 +9,12 @@ Summary:	Event-based init daemon
 Summary(hu.UTF-8):	Esemény-vezérelt init démon
 Summary(pl.UTF-8):	Oparty na zdarzeniach demon init
 Name:		upstart
-Version:	1.1
-Release:	2.0
+Version:	1.2
+Release:	1
 License:	GPL v2
 Group:		Base
-Source0:	http://launchpad.net/upstart/1.x/1.0/+download/%{name}-%{version}.tar.gz
-# Source0-md5:	9e9ce9d5e3936e59331f478d8a436e00
+Source0:	http://launchpad.net/upstart/1.x/1.2/+download/%{name}-%{version}.tar.gz
+# Source0-md5:	c1b1bab5c1c1ed2595081d8178542b37
 URL:		http://upstart.at/
 Patch0:		pldize.patch
 # https://code.launchpad.net/~jajcus-jajcus/upstart/state-save-stable/+merge/27053/+preview-diff/+files/preview.diff
@@ -71,7 +71,8 @@ cp -a %{SOURCE2} conf
 %{__aclocal} -I m4
 %{__autoconf}
 %{__automake}
-%configure
+%configure \
+	--disable-silent-rules
 %{__make}
 
 %{?with_tests:%{__make} check}
