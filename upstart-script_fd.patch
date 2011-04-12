@@ -1,0 +1,78 @@
+diff -dur upstart-1.2.orig/init/job_process.c upstart-1.2/init/job_process.c
+--- upstart-1.2.orig/init/job_process.c	2011-03-22 18:18:00.000000000 +0100
++++ upstart-1.2/init/job_process.c	2011-04-11 10:31:56.000000000 +0200
+@@ -208,12 +208,8 @@
+ 
+ 			shell = TRUE;
+ 
+-			/* FIXME actually always want it to be /proc/self/fd/3 and
+-			 * dup2() in the child to make it that way ... no way
+-			 * of passing that yet
+-			 */
+ 			cmd = NIH_MUST (nih_sprintf (argv, "%s/%d",
+-						     "/proc/self/fd", fds[0]));
++						     "/proc/self/fd", 3));
+ 			NIH_MUST (nih_str_array_addp (&argv, NULL,
+ 						      &argc, cmd));
+ 		}
+@@ -259,7 +255,7 @@
+ 
+ 	/* Spawn the process, repeat until fork() works */
+ 	while ((job->pid[process] = job_process_spawn (job->class, argv,
+-						       env, trace)) < 0) {
++				       env, trace, shell?fds[0]:-1)) < 0) {
+ 		NihError *err;
+ 
+ 		err = nih_error_get ();
+@@ -321,7 +317,7 @@
+ 		 * a path. Instruct the shell to close this extra fd and
+ 		 * not to leak it.
+ 		 */
+-		NIH_ZERO (nih_io_printf (io, "exec %d<&-\n", fds[0]));
++		NIH_ZERO (nih_io_printf (io, "exec 3<&-\n"));
+ 
+ 		NIH_ZERO (nih_io_write (io, script, strlen (script)));
+ 		nih_io_shutdown (io);
+@@ -337,6 +333,7 @@
+  * @argv: NULL-terminated list of arguments for the process,
+  * @env: NULL-terminated list of environment variables for the process,
+  * @trace: whether to trace this process.
++ * @fd3: file descriptor to dup2() to descriptor 3
+  *
+  * This function spawns a new process using the @class details to set up the
+  * environment for it; the process is always a session and process group
+@@ -367,7 +364,8 @@
+ job_process_spawn (JobClass     *class,
+ 		   char * const  argv[],
+ 		   char * const *env,
+-		   int           trace)
++		   int           trace,
++		   int		 fd3)
+ {
+ 	sigset_t  child_set, orig_set;
+ 	pid_t     pid;
+@@ -566,6 +564,12 @@
+ 		}
+ 	}
+ 
++	/* move the script input to file descriptor #3 */
++	if (fd3 > 3) {
++		dup2(fd3, 3);
++		close(fd3);
++	}	
++
+ 	/* Execute the process, if we escape from here it failed */
+ 	if (execvp (argv[0], argv) < 0) {
+ 		nih_error_raise_system ();
+diff -dur upstart-1.2.orig/init/job_process.h upstart-1.2/init/job_process.h
+--- upstart-1.2.orig/init/job_process.h	2011-02-01 19:42:30.000000000 +0100
++++ upstart-1.2/init/job_process.h	2011-04-11 10:26:33.000000000 +0200
+@@ -80,7 +80,7 @@
+ int    job_process_run     (Job *job, ProcessType process);
+ 
+ pid_t  job_process_spawn   (JobClass *class, char * const argv[],
+-			    char * const *env, int trace)
++			    char * const *env, int trace, int fd3)
+ 	__attribute__ ((warn_unused_result));
+ 
+ void   job_process_kill    (Job *job, ProcessType process);

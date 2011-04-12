@@ -10,7 +10,7 @@ Summary(hu.UTF-8):	Esemény-vezérelt init démon
 Summary(pl.UTF-8):	Oparty na zdarzeniach demon init
 Name:		upstart
 Version:	1.2
-Release:	1
+Release:	2
 License:	GPL v2
 Group:		Base
 Source0:	http://launchpad.net/upstart/1.x/1.2/+download/%{name}-%{version}.tar.gz
@@ -19,6 +19,7 @@ URL:		http://upstart.at/
 Patch0:		pldize.patch
 # https://code.launchpad.net/~jajcus-jajcus/upstart/state-save-stable/+merge/27053/+preview-diff/+files/preview.diff
 Patch1:		%{name}-state_save.patch
+Patch2:		%{name}-script_fd.patch
 Source1:	start-ttys.conf
 Source2:	tty.conf
 Source3:	%{name}.sysconfig
@@ -64,6 +65,7 @@ podczas wyłączania systemu, a także nadzorowaniem ich pracy.
 %setup -q
 %patch0 -p1
 %{?with_statesave:%patch1 -p0}
+%patch2 -p1
 cp -a %{SOURCE1} conf
 cp -a %{SOURCE2} conf
 
