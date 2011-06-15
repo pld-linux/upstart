@@ -1,25 +1,20 @@
-# TODO
-# - 4 of 13 tests failed (3 with 'permission denied')
 #
 # Conditional build:
-%bcond_with	statesave	# state-save experimental patch
-%bcond_with	tests		# don't perform "make check"
+%bcond_without	tests		# don't perform "make check"
 
 Summary:	Event-based init daemon
 Summary(hu.UTF-8):	Esemény-vezérelt init démon
 Summary(pl.UTF-8):	Oparty na zdarzeniach demon init
 Name:		upstart
-Version:	1.2
-Release:	2
+Version:	1.3
+Release:	1
 License:	GPL v2
 Group:		Base
-Source0:	http://launchpad.net/upstart/1.x/1.2/+download/%{name}-%{version}.tar.gz
-# Source0-md5:	c1b1bab5c1c1ed2595081d8178542b37
+Source0:	http://launchpad.net/upstart/1.x/1.3/+download/%{name}-%{version}.tar.gz
+# Source0-md5:	7820797b64878c27115fff6a7398a6a9
 URL:		http://upstart.at/
 Patch0:		pldize.patch
-# https://code.launchpad.net/~jajcus-jajcus/upstart/state-save-stable/+merge/27053/+preview-diff/+files/preview.diff
-Patch1:		%{name}-state_save.patch
-Patch2:		%{name}-script_fd.patch
+Patch1:		%{name}-tests.patch
 Source1:	start-ttys.conf
 Source2:	tty.conf
 Source3:	%{name}.sysconfig
@@ -30,7 +25,7 @@ BuildRequires:	expat-devel
 BuildRequires:	gcc >= 5:4.0
 BuildRequires:	gettext >= 0.14.5
 BuildRequires:	glibc-headers >= 6:2.4.0
-BuildRequires:	libnih-devel >= 1.0.2
+BuildRequires:	libnih-devel >= 1.0.3
 BuildRequires:	libtool >= 2:1.5.22
 BuildRequires:	pkgconfig
 BuildRequires:	rpmbuild(macros) >= 1.402
@@ -64,8 +59,7 @@ podczas wyłączania systemu, a także nadzorowaniem ich pracy.
 %prep
 %setup -q
 %patch0 -p1
-%{?with_statesave:%patch1 -p0}
-%patch2 -p1
+%patch1 -p1
 cp -a %{SOURCE1} conf
 cp -a %{SOURCE2} conf
 
@@ -77,7 +71,7 @@ cp -a %{SOURCE2} conf
 	--disable-silent-rules
 %{__make}
 
-%{?with_tests:%{__make} check}
+%{?with_tests:TERM=linux %{__make} check}
 
 %install
 rm -rf $RPM_BUILD_ROOT
@@ -118,6 +112,8 @@ rm -rf $RPM_BUILD_ROOT
 %config(noreplace) %verify(not md5 mtime size) %{_sysconfdir}/init/control-alt-delete.conf
 %config(noreplace) %verify(not md5 mtime size) %{_sysconfdir}/init/start-ttys.conf
 %config(noreplace) %verify(not md5 mtime size) %{_sysconfdir}/init/tty.conf
+%config(noreplace) %verify(not md5 mtime size) %{_sysconfdir}/init/upstart-socket-bridge.conf
+%config(noreplace) %verify(not md5 mtime size) %{_sysconfdir}/init/upstart-udev-bridge.conf
 %attr(755,root,root) %{_sbindir}/halt
 %attr(755,root,root) %{_sbindir}/init
 %attr(755,root,root) %{_sbindir}/initctl
@@ -131,6 +127,10 @@ rm -rf $RPM_BUILD_ROOT
 %attr(755,root,root) %{_sbindir}/status
 %attr(755,root,root) %{_sbindir}/stop
 %attr(755,root,root) %{_sbindir}/telinit
+%attr(755,root,root) %{_sbindir}/upstart-socket-bridge
+%attr(755,root,root) %{_sbindir}/upstart-udev-bridge
+%attr(755,root,root) %{_bindir}/init-checkconf
+%attr(755,root,root) %{_bindir}/initctl2dot
 %dir /lib/init
 %{_mandir}/man5/*.5*
 %{_mandir}/man7/*.7*
