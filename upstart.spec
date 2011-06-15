@@ -1,6 +1,9 @@
 #
+# TODO:
+#	- some tests still fail on builders
+#
 # Conditional build:
-%bcond_without	tests		# don't perform "make check"
+%bcond_with	tests		# perform "make check"
 
 Summary:	Event-based init daemon
 Summary(hu.UTF-8):	Esemény-vezérelt init démon
