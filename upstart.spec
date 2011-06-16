@@ -32,6 +32,7 @@ BuildRequires:	libnih-devel >= 1.0.3
 BuildRequires:	libtool >= 2:1.5.22
 BuildRequires:	pkgconfig
 BuildRequires:	rpmbuild(macros) >= 1.402
+BuildRequires:	udev-devel >= 146
 Requires:	dbus-libs >= 1.2.14-2
 Requires:	filesystem >= 3.0-35
 Suggests:	dbus
