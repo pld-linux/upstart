@@ -10,7 +10,7 @@ Summary(hu.UTF-8):	Esemény-vezérelt init démon
 Summary(pl.UTF-8):	Oparty na zdarzeniach demon init
 Name:		upstart
 Version:	1.3
-Release:	2
+Release:	3
 License:	GPL v2
 Group:		Base
 Source0:	http://launchpad.net/upstart/1.x/1.3/+download/%{name}-%{version}.tar.gz
@@ -31,7 +31,7 @@ BuildRequires:	glibc-headers >= 6:2.4.0
 BuildRequires:	libnih-devel >= 1.0.3
 BuildRequires:	libtool >= 2:1.5.22
 BuildRequires:	pkgconfig
-BuildRequires:	rpmbuild(macros) >= 1.402
+BuildRequires:	rpmbuild(macros) >= 1.615
 BuildRequires:	udev-devel >= 146
 Requires:	dbus-libs >= 1.2.14-2
 Requires:	filesystem >= 3.0-35
@@ -64,8 +64,8 @@ podczas wyłączania systemu, a także nadzorowaniem ich pracy.
 %setup -q
 %patch0 -p1
 %patch1 -p1
-cp -a %{SOURCE1} conf
-cp -a %{SOURCE2} conf
+cp -p %{SOURCE1} conf
+cp -p %{SOURCE2} conf
 
 %build
 %{__aclocal} -I m4
@@ -86,12 +86,13 @@ install -d $RPM_BUILD_ROOT{/etc/sysconfig,/lib/init}
 
 %find_lang upstart
 
-cp -a %{SOURCE3} $RPM_BUILD_ROOT/etc/sysconfig/%{name}
+cp -p %{SOURCE3} $RPM_BUILD_ROOT/etc/sysconfig/%{name}
 
 # no -devel
 rm -rf $RPM_BUILD_ROOT%{_includedir}
 rm -rf $RPM_BUILD_ROOT%{_libdir}/*.{la,so}
 rm -rf $RPM_BUILD_ROOT%{_aclocaldir}
+
 
 %clean
 rm -rf $RPM_BUILD_ROOT
