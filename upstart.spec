@@ -10,7 +10,7 @@ Summary(hu.UTF-8):	Esemény-vezérelt init démon
 Summary(pl.UTF-8):	Oparty na zdarzeniach demon init
 Name:		upstart
 Version:	1.3
-Release:	3
+Release:	4
 License:	GPL v2
 Group:		Base
 Source0:	http://launchpad.net/upstart/1.x/1.3/+download/%{name}-%{version}.tar.gz
@@ -21,6 +21,7 @@ Patch1:		%{name}-tests.patch
 Source1:	start-ttys.conf
 Source2:	tty.conf
 Source3:	%{name}.sysconfig
+Source4:	sysvinit.logrotate
 BuildRequires:	autoconf >= 2.59
 BuildRequires:	automake >= 1:1.9
 BuildRequires:	dbus-devel >= 1.2.16-1
@@ -34,13 +35,14 @@ BuildRequires:	pkgconfig
 BuildRequires:	rpmbuild(macros) >= 1.615
 BuildRequires:	udev-devel >= 146
 Requires:	dbus-libs >= 1.2.14-2
-Requires:	filesystem >= 3.0-35
+Requires:	filesystem >= 4.0
+Requires:	SysVinit-tools
 Suggests:	dbus
 Suggests:	vim-syntax-upstart
 Provides:	virtual(init-daemon)
 Obsoletes:	virtual(init-daemon)
 Conflicts:	dbus < 1.2.12-2
-Conflicts:	upstart-SysVinit < 2.86-23.2
+Conflicts:	upstart-SysVinit
 BuildRoot:	%{tmpdir}/%{name}-%{version}-root-%(id -u -n)
 
 %define		_sbindir		/sbin
@@ -79,7 +81,7 @@ cp -p %{SOURCE2} conf
 
 %install
 rm -rf $RPM_BUILD_ROOT
-install -d $RPM_BUILD_ROOT{/etc/sysconfig,/lib/init}
+install -d $RPM_BUILD_ROOT{/etc/{logrotate.d,sysconfig},/lib/init,/var/{run,log}}
 
 %{__make} install \
 	DESTDIR=$RPM_BUILD_ROOT
@@ -88,20 +90,45 @@ install -d $RPM_BUILD_ROOT{/etc/sysconfig,/lib/init}
 
 cp -p %{SOURCE3} $RPM_BUILD_ROOT/etc/sysconfig/%{name}
 
+ln -sf ../var/run/initrunlvl $RPM_BUILD_ROOT%{_sysconfdir}
+cp -a %{SOURCE1} $RPM_BUILD_ROOT/etc/logrotate.d/sysvinit
+> $RPM_BUILD_ROOT/var/run/initrunlvl
+> $RPM_BUILD_ROOT%{_sysconfdir}/ioctl.save
+> $RPM_BUILD_ROOT/var/log/faillog
+> $RPM_BUILD_ROOT/var/log/lastlog
+> $RPM_BUILD_ROOT/var/log/wtmpx
+> $RPM_BUILD_ROOT/var/log/btmpx
+
 # no -devel
 rm -rf $RPM_BUILD_ROOT%{_includedir}
 rm -rf $RPM_BUILD_ROOT%{_libdir}/*.{la,so}
 rm -rf $RPM_BUILD_ROOT%{_aclocaldir}
 
-
 %clean
 rm -rf $RPM_BUILD_ROOT
 
+%pre
+%groupadd -g 22 utmp
+
 %post
 /sbin/ldconfig
+
+touch %{_sysconfdir}/ioctl.save /var/log/{{fail,last}log,btmpx}
+chmod 000 %{_sysconfdir}/ioctl.save /var/log/{fail,last}log
+chown root:root %{_sysconfdir}/ioctl.save /var/log/faillog
+chown root:utmp /var/log/lastlog
+chmod 600 %{_sysconfdir}/ioctl.save
+chmod 640 /var/log/faillog
+chmod 660 /var/log/lastlog
+chmod 640 /var/log/btmpx
+
 /sbin/telinit u || :
 
-%postun	-p /sbin/ldconfig
+%postun
+/sbin/ldconfig
+if [ "$1" = "0" ]; then
+	%groupremove utmp
+fi
 
 %triggerpostun -- glibc
 /sbin/telinit u || :
@@ -140,3 +167,12 @@ rm -rf $RPM_BUILD_ROOT
 %{_mandir}/man5/*.5*
 %{_mandir}/man7/*.7*
 %{_mandir}/man8/*.8*
+
+%attr(640,root,root) /etc/logrotate.d/sysvinit
+%ghost %{_sysconfdir}/initrunlvl
+%ghost /var/run/initrunlvl
+%attr(600,root,root) %ghost %{_sysconfdir}/ioctl.save
+%attr(640,root,root) %ghost /var/log/faillog
+%attr(660,root,utmp) %ghost /var/log/lastlog
+%attr(664,root,utmp) %ghost /var/log/wtmpx
+%attr(640,root,root) %ghost /var/log/btmpx
