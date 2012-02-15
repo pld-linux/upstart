@@ -10,7 +10,7 @@ Summary(hu.UTF-8):	Esemény-vezérelt init démon
 Summary(pl.UTF-8):	Oparty na zdarzeniach demon init
 Name:		upstart
 Version:	1.3
-Release:	4
+Release:	5
 License:	GPL v2
 Group:		Base
 Source0:	http://launchpad.net/upstart/1.x/1.3/+download/%{name}-%{version}.tar.gz
@@ -91,7 +91,7 @@ install -d $RPM_BUILD_ROOT{/etc/{logrotate.d,sysconfig},/lib/init,/var/{run,log}
 cp -p %{SOURCE3} $RPM_BUILD_ROOT/etc/sysconfig/%{name}
 
 ln -sf ../var/run/initrunlvl $RPM_BUILD_ROOT%{_sysconfdir}
-cp -a %{SOURCE1} $RPM_BUILD_ROOT/etc/logrotate.d/sysvinit
+cp -a %{SOURCE4} $RPM_BUILD_ROOT/etc/logrotate.d/sysvinit
 > $RPM_BUILD_ROOT/var/run/initrunlvl
 > $RPM_BUILD_ROOT%{_sysconfdir}/ioctl.save
 > $RPM_BUILD_ROOT/var/log/faillog
