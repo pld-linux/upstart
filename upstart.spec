@@ -10,7 +10,7 @@ Summary(hu.UTF-8):	Esemény-vezérelt init démon
 Summary(pl.UTF-8):	Oparty na zdarzeniach demon init
 Name:		upstart
 Version:	1.3
-Release:	6
+Release:	7
 License:	GPL v2
 Group:		Base
 Source0:	http://launchpad.net/upstart/1.x/1.3/+download/%{name}-%{version}.tar.gz
@@ -34,11 +34,12 @@ BuildRequires:	libtool >= 2:1.5.22
 BuildRequires:	pkgconfig
 BuildRequires:	rpmbuild(macros) >= 1.615
 BuildRequires:	udev-devel >= 146
+Requires:	SysVinit-tools
 Requires:	dbus-libs >= 1.2.14-2
 Requires:	filesystem >= 4.0
-Requires:	SysVinit-tools
 Suggests:	dbus
 Suggests:	vim-syntax-upstart
+Provides:	group(utmp)
 Provides:	virtual(init-daemon)
 Obsoletes:	virtual(init-daemon)
 Conflicts:	dbus < 1.2.12-2
