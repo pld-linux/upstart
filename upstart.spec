@@ -34,6 +34,8 @@ BuildRequires:	libtool >= 2:1.5.22
 BuildRequires:	pkgconfig
 BuildRequires:	rpmbuild(macros) >= 1.615
 BuildRequires:	udev-devel >= 146
+Requires(pre):	/usr/bin/getgid
+Requires(pre):	/usr/sbin/groupadd
 Requires:	SysVinit-tools
 Requires:	dbus-libs >= 1.2.14-2
 Requires:	filesystem >= 4.0
