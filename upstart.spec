@@ -1,6 +1,6 @@
-#
 # TODO:
 #	- some tests still fail on builders
+# - subpackage for monitor?
 #
 # Conditional build:
 %bcond_with	tests		# perform "make check"
@@ -9,15 +9,14 @@ Summary:	Event-based init daemon
 Summary(hu.UTF-8):	Esemény-vezérelt init démon
 Summary(pl.UTF-8):	Oparty na zdarzeniach demon init
 Name:		upstart
-Version:	1.3
-Release:	8
+Version:	1.11
+Release:	0.1
 License:	GPL v2
 Group:		Base
-Source0:	http://launchpad.net/upstart/1.x/1.3/+download/%{name}-%{version}.tar.gz
-# Source0-md5:	7820797b64878c27115fff6a7398a6a9
-URL:		http://upstart.at/
+Source0:	http://upstart.ubuntu.com/download/%{version}/%{name}-%{version}.tar.gz
+# Source0-md5:	e42aa0aa1c82bf583b2ce94a008443ed
+URL:		http://upstart.ubuntu.com/
 Patch0:		pldize.patch
-Patch1:		%{name}-tests.patch
 Source1:	start-ttys.conf
 Source2:	tty.conf
 Source3:	%{name}.sysconfig
@@ -69,7 +68,6 @@ podczas wyłączania systemu, a także nadzorowaniem ich pracy.
 %prep
 %setup -q
 %patch0 -p1
-%patch1 -p1
 cp -p %{SOURCE1} conf
 cp -p %{SOURCE2} conf
 
@@ -144,10 +142,15 @@ fi
 %defattr(644,root,root,755)
 %doc AUTHORS ChangeLog HACKING NEWS TODO
 /etc/dbus-1/system.d/Upstart.conf
+%attr(640,root,root) /etc/logrotate.d/sysvinit
+%ghost %{_sysconfdir}/initrunlvl
 %config(noreplace) %verify(not md5 mtime size) /etc/sysconfig/%{name}
 %config(noreplace) %verify(not md5 mtime size) %{_sysconfdir}/init/control-alt-delete.conf
 %config(noreplace) %verify(not md5 mtime size) %{_sysconfdir}/init/start-ttys.conf
 %config(noreplace) %verify(not md5 mtime size) %{_sysconfdir}/init/tty.conf
+%config(noreplace) %verify(not md5 mtime size) %{_sysconfdir}/init/upstart-dbus-bridge.conf
+%config(noreplace) %verify(not md5 mtime size) %{_sysconfdir}/init/upstart-event-bridge.conf
+%config(noreplace) %verify(not md5 mtime size) %{_sysconfdir}/init/upstart-file-bridge.conf
 %config(noreplace) %verify(not md5 mtime size) %{_sysconfdir}/init/upstart-socket-bridge.conf
 %config(noreplace) %verify(not md5 mtime size) %{_sysconfdir}/init/upstart-udev-bridge.conf
 %attr(755,root,root) %{_sbindir}/halt
@@ -163,6 +166,11 @@ fi
 %attr(755,root,root) %{_sbindir}/status
 %attr(755,root,root) %{_sbindir}/stop
 %attr(755,root,root) %{_sbindir}/telinit
+%attr(755,root,root) %{_sbindir}/upstart-dbus-bridge
+%attr(755,root,root) %{_sbindir}/upstart-dconf-bridge
+%attr(755,root,root) %{_sbindir}/upstart-event-bridge
+%attr(755,root,root) %{_sbindir}/upstart-file-bridge
+%attr(755,root,root) %{_sbindir}/upstart-local-bridge
 %attr(755,root,root) %{_sbindir}/upstart-socket-bridge
 %attr(755,root,root) %{_sbindir}/upstart-udev-bridge
 %attr(755,root,root) %{_bindir}/init-checkconf
@@ -172,11 +180,35 @@ fi
 %{_mandir}/man7/*.7*
 %{_mandir}/man8/*.8*
 
-%attr(640,root,root) /etc/logrotate.d/sysvinit
-%ghost %{_sysconfdir}/initrunlvl
+%dir %{_datadir}/upstart
+%dir %{_datadir}/upstart/sessions
+%{_datadir}/upstart/sessions/re-exec.conf
+%{_datadir}/upstart/sessions/upstart-dbus-session-bridge.conf
+%{_datadir}/upstart/sessions/upstart-dbus-system-bridge.conf
+%{_datadir}/upstart/sessions/upstart-dconf-bridge.conf
+%{_datadir}/upstart/sessions/upstart-event-bridge.conf
+%{_datadir}/upstart/sessions/upstart-file-bridge.conf
+
 %ghost /var/run/initrunlvl
 %attr(600,root,root) %ghost %{_sysconfdir}/ioctl.save
 %attr(640,root,root) %ghost /var/log/faillog
 %attr(660,root,utmp) %ghost /var/log/lastlog
 %attr(664,root,utmp) %ghost /var/log/wtmpx
 %attr(640,root,root) %ghost /var/log/btmpx
+
+# -libs
+%ghost %{_libdir}/libupstart.so.1
+%attr(755,root,root) %{_libdir}/libupstart.so.*.*.*
+
+# monitor
+%attr(755,root,root) %{_bindir}/upstart-monitor
+%{_desktopdir}/upstart-monitor.desktop
+%{_iconsdir}/hicolor/scalable/apps/upstart-monitor.svg
+%dir %{_datadir}/upstart/icons
+%{_datadir}/upstart/icons/upstart-monitor.svg
+
+# devel
+/usr/lib/pkgconfig/libupstart.pc
+
+# static
+%{_libdir}/libupstart.a
