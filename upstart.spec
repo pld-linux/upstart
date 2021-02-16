@@ -42,8 +42,8 @@ Requires:	filesystem >= 4.0
 Suggests:	dbus
 Suggests:	vim-syntax-upstart
 Provides:	group(utmp)
-Provides:	virtual(init-daemon)
-Obsoletes:	virtual(init-daemon)
+Provides:	virtual-init-daemon
+Obsoletes:	virtual-init-daemon
 Conflicts:	dbus < 1.2.12-2
 Conflicts:	upstart-SysVinit
 BuildRoot:	%{tmpdir}/%{name}-%{version}-root-%(id -u -n)
